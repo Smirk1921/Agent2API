@@ -17,6 +17,26 @@ use crate::server::core::{
 };
 
 const MAX_WORKERS: usize = 64;
+/// CodeArts 换票的进程级最小间隔。
+///
+/// 华为 STS 对本机 IP 的限流约 20 次/秒；启动时插件会把所有到期账号几乎同时
+/// 打过来（实测 50+ 并发），超限后大量 429，失败路径会把槽封成 Blocked ——
+/// 表面上是“全部更新失败”，其实令牌还活着。这里把发送串行化到约 8 次/秒，
+/// 低于限流阈值；单次 25 秒的请求预算足够排完一整批。
+const REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(120);
+static REFRESH_PACING: OnceLock<tokio::sync::Mutex<Option<Instant>>> = OnceLock::new();
+
+async fn pace_refresh() {
+    let gate = REFRESH_PACING.get_or_init(|| tokio::sync::Mutex::new(None));
+    let mut last = gate.lock().await;
+    if let Some(previous) = *last {
+        let earliest = previous + REFRESH_MIN_INTERVAL;
+        if earliest > Instant::now() {
+            tokio::time::sleep_until(earliest).await;
+        }
+    }
+    *last = Some(Instant::now());
+}
 
 struct Job {
     handle: Option<JoinHandle<()>>,
@@ -153,6 +173,9 @@ async fn run(owner: &mut Ownership) -> Result<Value, proto::WireError> {
         return Err(unknown());
     }
     owner.request = Some(request);
+    // 排队等待节拍放在 “Ready→Pending” 之前：等待期间槽仍是 Ready，
+    // 进程若在这时退出也不会留下悬挂的 Pending；等待也不计入 HTTP 预算。
+    pace_refresh().await;
     call.with_current(|| Ok(()))?;
     let ready = owner.ready.take().ok_or_else(unknown)?;
     let result = tokio::task::spawn_blocking(move || ready.consume_pending()).await
@@ -163,6 +186,7 @@ async fn run(owner: &mut Ownership) -> Result<Value, proto::WireError> {
     }
     let request = owner.request.take().ok_or_else(unknown)?;
     let client = owner.client.as_ref().ok_or_else(unknown)?;
+    // 25 秒预算只覆盖实际请求（节拍等待已在 Ready→Pending 之前完成）。
     let deadline = call.deadline().min(Instant::now() + Duration::from_secs(25));
     let read = tokio::time::timeout_at(deadline, async {
         let mut response = client.client().map_err(|_| unknown())?.execute(request).await.map_err(|_| unknown())?;

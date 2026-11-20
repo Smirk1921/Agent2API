@@ -24,6 +24,26 @@ pub(in crate::server::core::account_store::sql) enum WriteKind {
     Imported,
 }
 
+/// 一次保存对私有版本的处理方式。
+///
+/// 关键点：`Imported` 只说明“整份输入没有逐行来源见证”，并不等于“每一行都换了授权”。
+/// 是否换授权必须由同事务读出的真实行与待写行比较得出；无变化时沿用原版本，
+/// 否则一次无关导入会把所有已登记账号的 CodeArts 续期槽全部作废。
+#[derive(Debug, PartialEq, Eq)]
+enum VersionPlan {
+    Preserve,
+    ResetAuthorization,
+    Bump,
+}
+
+fn version_plan(kind: WriteKind, changed: bool) -> VersionPlan {
+    match (kind, changed) {
+        (WriteKind::Replace | WriteKind::Imported, true) => VersionPlan::ResetAuthorization,
+        (_, true) => VersionPlan::Bump,
+        (_, false) => VersionPlan::Preserve,
+    }
+}
+
 pub(in crate::server::core::account_store::sql) struct PreparedRow<'a> {
     record: Cow<'a, StoredAccount>,
     existed: bool,
@@ -189,27 +209,39 @@ fn maintain(
         // 普通凭据仍按原输入保存；无法证明同一授权时不留下可被复用的私有版本。
         return Ok(());
     };
-    let version = if matches!(kind, WriteKind::Replace | WriteKind::Imported) {
-        let born = storage::random_id()?;
-        if born == version.born {
-            return Err(Error::Storage(StorageFailure::RandomUnavailable));
+    let changed = before != after || reauthorization_changed(current, next);
+    // 整份导入/替换不再无条件换 born。逐行“授权材料有没有变”是从同事务读出的
+    // 真实行与待写行比较出来的：没变就说明这次保存没有引入新授权，沿用原版本；
+    // 变了才重建版本，并且必须让该账号的 CodeArts 续期槽一起失效 —— 否则会留下
+    // 「账号 rev1/新 born + 槽 rev2/旧 born」的错位，之后每次换票都判定 ReceiptChanged，
+    // 表现为刷新全部 409、自动维护却报“无需刷新”。
+    let version = match version_plan(kind, changed) {
+        VersionPlan::Preserve => version,
+        VersionPlan::ResetAuthorization => {
+            let born = storage::random_id()?;
+            if born == version.born {
+                return Err(Error::Storage(StorageFailure::RandomUnavailable));
+            }
+            Version {
+                born,
+                revision: 1,
+                ..version
+            }
         }
-        Version {
-            born,
-            revision: 1,
-            ..version
-        }
-    } else if before != after || reauthorization_changed(current, next) {
-        Version {
+        VersionPlan::Bump => Version {
             revision: version
                 .revision
                 .checked_add(1)
                 .ok_or(Error::VersionExhausted)?,
             ..version
-        }
-    } else {
-        version
+        },
     };
+    // 任何路径只要授权材料变了（含普通 Update 的凭据替换），旧槽就不再对应本次授权：
+    // 版本推进却没有同步槽，会让后续每次换票都判 ReceiptChanged。这里统一让槽失效，
+    // 由显式登记重新建立；没变的保存（改名/启停/排序）不受影响。
+    if changed && current.provider() == "codearts" {
+        invalidate_codearts_slot(conn, current.id())?;
+    }
     // 唯一来源是刚才在同事务读出的真实行，不比较或采用传入的born/revision。
     storage::set_version(next.to_mut(), &version);
     // 私有标记也计入合同预算；加回标记后越界只撤去合同，不拒绝正常业务保存。
@@ -219,6 +251,28 @@ fn maintain(
             next.to_mut().remove(credential_version::PRIVATE_FIELD);
         }
         Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+/// 新授权落地时作废该账号的 CodeArts 续期槽：缺槽会被判“未登记”，
+/// 要求重新登记；比留下与账号版本不匹配的旧槽（每次刷新都 ReceiptChanged）诚实。
+/// 旧库没有这张表时跳过。
+fn invalidate_codearts_slot(conn: &Connection, id: &str) -> Result<(), Error> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema
+                WHERE type = 'table' AND name = 'codearts_refresh_slots')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| storage::sql_error(error, StorageFailure::Write))?;
+    if exists {
+        conn.execute(
+            "DELETE FROM main.codearts_refresh_slots WHERE account_id = ?1",
+            [id],
+        )
+        .map_err(|error| storage::sql_error(error, StorageFailure::Write))?;
     }
     Ok(())
 }
@@ -511,4 +565,26 @@ fn write_error(error: Error) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(
         format!("账号凭据版本维护失败，本次未确认保存（{error:?}）").into(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{version_plan, VersionPlan, WriteKind};
+
+    #[test]
+    fn imported_roundtrip_keeps_version() {
+        // 整份导入里“授权没变”的行必须沿用原版本；否则每导入一次，
+        // 所有已登记账号的 CodeArts 续期槽都会与账号版本错位、刷新全挂。
+        assert_eq!(version_plan(WriteKind::Imported, false), VersionPlan::Preserve);
+        assert_eq!(version_plan(WriteKind::Replace, false), VersionPlan::Preserve);
+        assert_eq!(version_plan(WriteKind::Update, false), VersionPlan::Preserve);
+    }
+
+    #[test]
+    fn changed_authorization_resets_or_bumps() {
+        // 真换了授权才重建版本；普通 Update 只推进一代。
+        assert_eq!(version_plan(WriteKind::Imported, true), VersionPlan::ResetAuthorization);
+        assert_eq!(version_plan(WriteKind::Replace, true), VersionPlan::ResetAuthorization);
+        assert_eq!(version_plan(WriteKind::Update, true), VersionPlan::Bump);
+    }
 }
