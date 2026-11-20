@@ -36,6 +36,23 @@ impl From<Error> for SlotFailure {
     }
 }
 
+impl SlotFailure {
+    /// 恢复日志用的稳定短标签；不输出任何凭证/账号内容。
+    pub(in crate::server::core::account_store) fn reason(&self) -> &'static str {
+        match self {
+            Self::Account(_) => "account-storage",
+            Self::Schema => "slot-schema",
+            Self::Missing => "slot-missing",
+            Self::Invalid => "slot-invalid",
+            Self::NotReady => "slot-not-ready",
+            Self::ReceiptChanged => "receipt-changed",
+            Self::RequiresNewAuthorization => "requires-new-authorization",
+            Self::IncompleteReplacement => "incomplete-replacement",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
 /// 不公开随机字段；只由严格读取真实Ready槽构造，不接JSON/账号/计时/默认代次。
 pub(in crate::server::core::account_store) struct ReadyGeneration {
     generation: String,
