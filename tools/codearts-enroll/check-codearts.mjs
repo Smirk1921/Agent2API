@@ -39,12 +39,34 @@ const hasJournal = Number(db.prepare(
   "SELECT COUNT(*) n FROM sqlite_schema WHERE type='table' AND name='codearts_refresh_results'").get().n) === 1;
 
 const rows = db.prepare("SELECT id, enabled, data FROM accounts WHERE provider='codearts' ORDER BY id").all();
+// 同义字段必须逐字一致：宿主在换票前会强校验，分叉的账号直到 AT 过期
+// 才会以“续期未确认/材料失败”暴露，提前体检能把它挡在维护之前。
+const ALIAS_GROUPS = [
+  ['access_key_id', 'accessKeyId', 'accessToken'],
+  ['secret_access_key', 'secretAccessKey'],
+  ['security_token', 'securityToken'],
+  ['refresh_token', 'refreshToken'],
+];
 const accounts = rows.map((row) => {
-  const out = { id: row.id, enabled: row.enabled === 1 || row.enabled === true, slot: 'missing', revision: null, version: null, match: false };
+  const out = { id: row.id, enabled: row.enabled === 1 || row.enabled === true, slot: 'missing', revision: null, version: null, match: false, aliasConflict: false, expiryConflict: false };
   try {
     const rec = JSON.parse(decode(row.data));
     out.version = rec._hostCredentialVersion?.revision ?? null;
     out.needsRelogin = rec.needsRelogin === true || rec.pluginSecret?.needsRelogin === true || rec.pluginPublic?.needsRelogin === true;
+    for (const target of [rec, rec.pluginSecret].filter((value) => value && typeof value === 'object')) {
+      for (const aliases of ALIAS_GROUPS) {
+        const values = aliases.filter((name) => typeof target[name] === 'string' && target[name]).map((name) => target[name]);
+        if (new Set(values).size > 1) out.aliasConflict = true;
+      }
+    }
+    const expiresAt = typeof rec.expiresAt === 'number' ? rec.expiresAt : null;
+    if (expiresAt) {
+      const iso = new Date(expiresAt).toISOString();
+      for (const target of [rec, rec.pluginSecret].filter((value) => value && typeof value === 'object')) {
+        if (target.expiration !== undefined && target.expiration !== iso) out.expiryConflict = true;
+        if (target.expires_at !== undefined && target.expires_at !== iso) out.expiryConflict = true;
+      }
+    }
     if (hasSlots) {
       const slotRow = db.prepare('SELECT payload FROM codearts_refresh_slots WHERE account_id=?').get(row.id);
       if (slotRow) {
@@ -64,7 +86,9 @@ let journal = 0;
 if (hasJournal) journal = Number(db.prepare('SELECT COUNT(*) n FROM codearts_refresh_results').get().n);
 
 const counts = accounts.reduce((acc, item) => {
-  const key = item.slot === 'ready' && item.match ? 'ready' : item.slot;
+  const key = item.aliasConflict || item.expiryConflict
+    ? 'material-conflict'
+    : item.slot === 'ready' && item.match ? 'ready' : item.slot;
   acc[key] = (acc[key] ?? 0) + 1;
   return acc;
 }, {});
@@ -73,7 +97,9 @@ if (JSON_OUT) {
   console.log(JSON.stringify({ ok, total: accounts.length, counts, journal, accounts }, null, 2));
 } else {
   for (const item of accounts) {
-    const state = item.slot === 'ready' && item.match ? 'ready' : `${item.slot}${item.slot === 'ready' ? '(version-mismatch)' : ''}`;
+    const state = item.aliasConflict || item.expiryConflict
+      ? `material-conflict${item.aliasConflict ? '(aliases)' : ''}${item.expiryConflict ? '(expiry)' : ''}`
+      : item.slot === 'ready' && item.match ? 'ready' : `${item.slot}${item.slot === 'ready' ? '(version-mismatch)' : ''}`;
     console.log(`${state.padEnd(24)} enabled=${String(item.enabled).padEnd(5)} rev=${item.version ?? '-'} ${item.id}`);
   }
   console.log('统计:', JSON.stringify(counts), '| 待补结算日志:', journal);

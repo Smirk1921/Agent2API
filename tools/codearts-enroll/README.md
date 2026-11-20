@@ -32,6 +32,8 @@ node enroll-codearts.mjs --db "<data>\agent2api.db" --key "<data>\account.key" -
 - `enroll`：缺槽，补登记。
 - `reset`：槽存在但不是 Ready 或版本不一致，重置为 Ready。
 - `skip`：缺少 `oauth_context` / PKCE 不自洽 / 账号行解不开，需要重新登录，脚本不动。
+- `material-conflict`：同义字段分叉（如 `access_key_id` 与 `accessKeyId` 不是同一枚令牌）或到期字段不一致。宿主会在换票前拒绝这类账号，表现为 AT 过期后“续期未确认”；用 `fix-alias-groups` 一类脚本统一这些字段后再刷新。
+
 
 ## 注意
 
