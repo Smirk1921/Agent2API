@@ -40,6 +40,8 @@
 
 use serde_json::{json, Value};
 
+use std::time::Duration;
+
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::providers::adapter::ProviderAdapter;
 use crate::server::errors::GatewayError;
@@ -128,6 +130,19 @@ pub async fn refresh_selected_accounts(store: &AccountStore, selected: Option<&[
 }
 
 pub async fn refresh_accounts(store: &AccountStore, selected: Option<&[String]>, forced: &[String]) -> Vec<Value> {
+    // 先补完上次“上游已换票、本地未结算”的恢复日志，再进入本轮刷新。
+    let recovered = {
+        let store = store.clone();
+        crate::server::core::blocking::run(move || store.recover_codearts_refresh_results())
+            .await
+            .unwrap_or(0)
+    };
+    if recovered > 0 {
+        logging::log(
+            "[Accounts]",
+            &format!("CodeArts 换票结果恢复：完成 {recovered} 个账号"),
+        );
+    }
     let before = crate::server::core::maintenance::types::accounts(store);
     let snapshot = store.list_accounts();
     let accounts: Vec<Value> = snapshot
@@ -210,10 +225,27 @@ pub async fn refresh_accounts(store: &AccountStore, selected: Option<&[String]>,
         "[Accounts]",
         &format!("检测到 {} 个临期账号，开始自动刷新凭证…", pending.len()),
     );
+    // 分批节流：启动后的第一轮维护往往积压了几十个到期账号。逐条串行也挡不住
+    // 「插件侧锁竞争 / 上游短时风控」在整轮内累积 —— 实测一轮 86 个里会有十几条
+    // 在发送前失败。每批之间停一下，让插件与上游都有喘息窗口。
+    const REFRESH_BATCH: usize = 8;
+    const REFRESH_BATCH_PAUSE: Duration = Duration::from_secs(2);
+    let mut processed = 0usize;
     for (index, id, provider, adapter) in pending {
         if store.needs_relogin(&id) {
             slots[index] = Some(skipped(&id, &provider, "登录授权已失效，需要重新登录该账号"));
             continue;
+        }
+        // 扫描之后、真正刷新之前，账号可能已被别的路径刷新过（插件重试、手动点刷新）。
+        // 有效期已经推进时跳过：再刷一次会占走刚更新的槽，失败就把好账号封成
+        // “上次续期未确认”，而它本来已经刷新成功。
+        if let (Some(scanned), Some((current, _))) =
+            (before.get(&id).and_then(|account| account.expires_at), store.credential_stamp(&id))
+        {
+            if current > scanned as f64 {
+                slots[index] = Some(skipped(&id, &provider, "扫描后已被其他操作刷新"));
+                continue;
+            }
         }
         // 走适配器而不是别处：这条已经是四家统一的刷新入口
         // （小浣熊 / AutoClaw 会按来源比较-再写回账号记录，workbuddy 走
@@ -239,6 +271,7 @@ pub async fn refresh_accounts(store: &AccountStore, selected: Option<&[String]>,
             }),
         };
         row["durationMs"] = json!(started.elapsed().as_millis().min(i64::MAX as u128) as i64);
+        row["code"] = json!(result.as_ref().err().and_then(|error| error.code.clone()));
         let message = if result.is_ok() {
             format!("✅ 已自动刷新账号 {id} 的凭证")
         } else {
@@ -263,6 +296,14 @@ pub async fn refresh_accounts(store: &AccountStore, selected: Option<&[String]>,
             })),
         );
         slots[index] = Some(row);
+        processed += 1;
+        if processed % REFRESH_BATCH == 0 {
+            logging::verbose(
+                "[Accounts]",
+                &format!("已处理 {processed} 个临期账号，暂停 {}s 后继续", REFRESH_BATCH_PAUSE.as_secs()),
+            );
+            tokio::time::sleep(REFRESH_BATCH_PAUSE).await;
+        }
     }
 
     let mut results: Vec<Value> = slots.into_iter().flatten().collect();
@@ -273,6 +314,21 @@ pub async fn refresh_accounts(store: &AccountStore, selected: Option<&[String]>,
         row["expiresAfter"] = json!(after.get(&id).and_then(|account| account.expires_at));
         row["forced"] = json!(forced.iter().any(|account_id| account_id == &id));
         if row["status"] == STATUS_REFRESHED { row["credentialChanged"] = json!(true); }
+    }
+    // 失败按阶段码聚合：一次批量维护只留一条分布，避免逐条 ❌ 之外没有总览，
+    // 也避免把 17 个「发送前失败」误读成 17 个令牌失效。
+    let mut failure_codes: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for row in results.iter().filter(|row| row["status"] == STATUS_FAILED) {
+        let code = row.get("code").and_then(Value::as_str).unwrap_or("unknown").to_string();
+        *failure_codes.entry(code).or_insert(0) += 1;
+    }
+    if !failure_codes.is_empty() {
+        let summary = failure_codes
+            .iter()
+            .map(|(code, count)| format!("{code}×{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        logging::log("[Accounts]", &format!("本轮失败分布：{summary}"));
     }
     results
 }

@@ -2,7 +2,7 @@
 
 import * as React from 'react'
 import {
-  Button, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogSection,
+  Button, Checkbox, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogSection,
   DialogTitle, Input, Label, RadioGroup, RadioGroupItem, Select, SelectContent,
   SelectItem, SelectTrigger, SelectValue,
   Field, FieldLabel, FieldSet,
@@ -10,7 +10,8 @@ import {
 import { t } from '../i18n'
 import {
   ACCOUNT_CONCURRENCY_MAX as CONC_MAX, errorMessage, esc, shared, toast,
-  type AccountRecord, type BatchAccountsPayload, type BatchAccountsResult, type BatchLimiterMode, type LimiterGroup,
+  type AccountRecord, type BatchAccountsPayload, type BatchAccountsResult, type BatchExportMode,
+  type BatchLimiterMode, type LimiterGroup,
 } from './accounts-shared'
 import {
   displayNameOf, providerFeatures, providerOf, supportsProxyRotate, supportsUsage,
@@ -30,6 +31,7 @@ const BATCH_ACTIONS = [
   { value: 'concurrency', label: () => t('设置并发上限') },
   { value: 'usageQuery', label: () => t('查询设置') },
   { value: 'limiters', label: () => t('限制器') },
+  { value: 'export', label: () => t('导出') },
   { value: 'remove', label: () => t('删除') },
 ] as const
 
@@ -53,6 +55,9 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
   const [usageDraft, setUsageDraft] = React.useState<UsageDraft>(() => ({ ...usageDraftOf(null), intervalInput: '' }))
   const [limiterMode, setLimiterMode] = React.useState<BatchLimiterMode>('append')
   const [limiterDraft, setLimiterDraft] = React.useState<LimiterGroup[]>([])
+  // 批量导出：合并成一个导入文件，或每账号一个 JSON 打包；可选导出成功后删除
+  const [exportMode, setExportMode] = React.useState<BatchExportMode>('combined')
+  const [deleteAfterExport, setDeleteAfterExport] = React.useState(false)
   const [sourceId, setSourceId] = React.useState('')
   const [busy, setBusy] = React.useState(false)
   const [result, setResult] = React.useState<React.ReactNode>('')
@@ -70,7 +75,9 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
     (cap, account) => Math.max(cap, Number(providerFeatures(providerOf(account)).concurrencyDefault) || 0), 0,
   )
   const allowRotate = accounts.length > 0 && accounts.every(supportsProxyRotate)
-  const destructive = current === 'remove' || (current === 'limiters' && (limiterMode === 'replace' || limiterMode === 'clear'))
+  const destructive = current === 'remove'
+    || (current === 'export' && deleteAfterExport)
+    || (current === 'limiters' && (limiterMode === 'replace' || limiterMode === 'clear'))
   const verb = current === 'limiters'
     ? (limiterMode === 'append' ? t('追加限制规则') : LIMITER_MODES.find(item => item.value === limiterMode)!.label())
     : BATCH_ACTIONS.find(item => item.value === current)!.label()
@@ -85,6 +92,7 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
 
   async function confirmOperation(): Promise<boolean> {
     const ask = shared().wbConfirm?.ask
+    const deleting = current === 'remove' || (current === 'export' && deleteAfterExport)
     if (current === 'remove') {
       const ok = await Promise.resolve(ask?.({
         title: t('删除选中的账号'),
@@ -93,15 +101,26 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
       }) ?? false)
       if (!ok) return false
     }
-    if (current === 'disable' || current === 'remove') {
+    if (current === 'export') {
+      const ok = await Promise.resolve(ask?.({
+        title: deleteAfterExport ? t('导出后删除账号') : t('导出账号'),
+        html: deleteAfterExport
+          ? t('将先导出选中的 <strong>{count}</strong> 个账号，再删除其中导出成功的账号。删除后无法恢复，确定继续？', { count: ids.length })
+          : t('导出文件包含登录凭证，可直接用于登录。请妥善保管，不要外传或上传到公共位置。'),
+        okText: deleteAfterExport ? t('导出并删除') : t('导出'),
+        okClass: deleteAfterExport ? 'danger' : undefined,
+      }) ?? false)
+      if (!ok) return false
+    }
+    if (current === 'disable' || deleting) {
       const picked = new Set(ids)
       const survivors = allAccounts().filter(account => account.enabled !== false && !picked.has(account.id))
       if (!survivors.length) {
-        const what = current === 'remove' ? t('删除') : t('禁用')
+        const what = deleting ? t('删除') : t('禁用')
         return Promise.resolve(ask?.({
           title: t('全部启用中的账号将被{what}', { what }),
           html: t('这会<strong>{what}</strong>所有启用中的账号，转发将不可用。确定继续？', { what }),
-          okText: what, okClass: current === 'remove' ? 'danger' : 'primary',
+          okText: what, okClass: deleting ? 'danger' : 'primary',
         }) ?? false)
       }
     }
@@ -168,6 +187,43 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
     setRefreshProgress(null)
     try {
       if (!(await confirmOperation())) return
+      if (current === 'export') {
+        const bridge = shared().workbuddyDesktop
+        if (!bridge?.batchExportAccounts) throw new Error(t('批量导出接口不可用，请更新客户端后重试'))
+        const data = await bridge.batchExportAccounts({ ids, mode: exportMode, deleteAfter: deleteAfterExport })
+        if (data?.canceled) return
+        if (!data) throw new Error(t('导出未返回结果'))
+        const count = data.count || 0
+        const failed = data.failed || []
+        const deleted = data.deleted || []
+        const deleteFailed = data.deleteFailed || []
+        const parts = [t('已导出 {count} 个账号', { count })]
+        if (deleted.length) parts.push(t('已删除 {count} 个账号', { count: deleted.length }))
+        if (failed.length) parts.push(t('{count} 个导出失败', { count: failed.length }))
+        if (deleteFailed.length) parts.push(t('{count} 个删除失败', { count: deleteFailed.length }))
+        const summary = parts.join(t('；'))
+        toast(summary, failed.length || deleteFailed.length ? 'err' : 'ok')
+        if (failed.length || deleteFailed.length) {
+          setResult(<div role='status' className='space-y-2'>
+            <p>{summary}</p>
+            {failed.length ? <p className='text-destructive'>{t('导出失败 {count} 个：', { count: failed.length })}
+              {failed.map(item => `${item.name || item.id || ''}（${item.error || ''}）`).join(t('；'))}
+            </p> : null}
+            {deleteFailed.length ? <p className='text-destructive'>{t('删除失败 {count} 个：', { count: deleteFailed.length })}
+              {deleteFailed.map(item => `${labelOf(findAccount(String(item.id))) || item.id || ''}（${item.error || ''}）`).join(t('；'))}
+            </p> : null}
+          </div>)
+        } else {
+          onClose()
+        }
+        try {
+          await refreshSavedAccounts()
+          await syncBalancesSnapshot()
+        } catch (error) {
+          toast(t('批量操作已保存，但列表刷新失败：{error}', { error: errorMessage(error) }), 'err')
+        }
+        return
+      }
       let data: BatchAccountsResult
       if (current === 'refresh') {
         data = await refreshAccountTokens(ids, setRefreshProgress)
@@ -233,7 +289,7 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
               })}</p> : null}
               {current === 'refresh'
                 ? <p>{t('逐个刷新所选账号的 Token，未到期也会尝试刷新；不改变启用状态、代理或转发顺序。')}</p>
-                : current !== 'remove' ? <p>{t('只修改本次选择的设置，不影响备注、凭证、转发顺序或其他设置。')}</p> : null}
+                : current !== 'remove' && current !== 'export' ? <p>{t('只修改本次选择的设置，不影响备注、凭证、转发顺序或其他设置。')}</p> : null}
             </DialogSection>
             <DialogSection>
               <h3>{t('操作')}</h3>
@@ -291,6 +347,27 @@ export function BatchDialog({ ids, action, onClose }: { ids: string[]; action: s
                   <UsageSettingsSection draft={usageDraft} onChange={setUsageDraft} idPrefix='batch-usage' />
                   <p className='detail mt-2.5'>{t('统一设置自动查询的开关、间隔和失败重试次数；不会复制或覆盖余额查询凭证。')}</p>
                 </> : <LimiterSection draft={limiterDraft} onChange={setLimiterDraft} allowBalance={usageAccounts.length > 0} />}
+              </div> : null}
+              {current === 'export' ? <div className='mt-2.5 space-y-2.5'>
+                <p className='detail'>{t('导出方式')}</p>
+                <RadioGroup value={exportMode} onValueChange={value => setExportMode(value as BatchExportMode)}
+                  disabled={busy} className='flex-col items-start gap-2' aria-label={t('导出方式')}>
+                  <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
+                    <RadioGroupItem value='combined' />{t('合并为一个 JSON（可直接导入）')}
+                  </Label>
+                  <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
+                    <RadioGroupItem value='separate' />{t('每个账号一个 JSON，打包成 ZIP')}
+                  </Label>
+                </RadioGroup>
+                <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
+                  <Checkbox checked={deleteAfterExport}
+                    onCheckedChange={value => setDeleteAfterExport(value === true)} disabled={busy} />
+                  {t('导出后删除这些账号')}
+                </Label>
+                {deleteAfterExport ? <p className='detail text-destructive'>
+                  {t('只删除导出成功的账号；删除后无法恢复。')}
+                </p> : null}
+                <p className='detail'>{t('导出文件包含登录凭证，可直接用于登录。请妥善保管，不要外传或上传到公共位置。')}</p>
               </div> : null}
               {current === 'usageQuery' && !usageDraft.enabled ? <p className='detail mt-2.5'>
                 {t('关闭自动查询后，余额限制器只能使用上次读数；手动查询仍可用。')}

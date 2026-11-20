@@ -565,8 +565,12 @@ function AccountsPage() {
                 还让人以为少了什么。清空选择也不必再给一颗「取消选择」—— 同一行左边那颗
                 「全选当前筛选结果」的勾就能取消全选，而逐行取消是行上的勾，都不缺入口 */}
             {active ? (
-              <Button id='btn-batch-open' variant='default'
-                onClick={() => openBatchDialog([...store.selected], 'enable')}>{t('批量操作')}</Button>
+              <>
+                <Button variant='outline'
+                  onClick={() => openBatchDialog([...store.selected], 'export')}>{t('导出')}</Button>
+                <Button id='btn-batch-open' variant='default'
+                  onClick={() => openBatchDialog([...store.selected], 'enable')}>{t('批量操作')}</Button>
+              </>
             ) : null}
           </div>
         </div>

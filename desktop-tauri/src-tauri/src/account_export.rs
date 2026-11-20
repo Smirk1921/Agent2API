@@ -2,6 +2,8 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::AppHandle;
@@ -124,4 +126,95 @@ fn write_content(file: &mut File, content: &[u8]) -> Result<(), String> {
     file.write_all(content)
         .and_then(|_| file.flush())
         .map_err(|error| format!("写入账号文件失败: {error}"))
+}
+
+/// 批量导出：内容由网关侧构造（合并 JSON 或逐账号 zip），壳只负责选路径与写盘。
+///
+/// 返回形状与网页桥 `batchExportAccounts` 逐字段一致：`{ count, fileName, failed,
+/// deleted, deleteFailed, file, saved }`。`deleteAfter` 的删除在网关侧完成，
+/// 壳不参与，也不因为删除失败把已成功的导出判成失败。
+#[tauri::command]
+pub async fn batch_export_accounts(app: AppHandle, payload: Value) -> Result<Value, String> {
+    // 先导出、落盘成功后再删：把 deleteAfter 从网关请求里摘掉，删除放到写盘之后，
+    // 避免「响应中断 → 账号已删、文件没拿到」。直接调 API 的脚本仍可用服务端开关。
+    let mut request = payload.clone();
+    if let Some(object) = request.as_object_mut() {
+        object.remove("deleteAfter");
+    }
+    let data = gateway::call("POST", "/api/accounts/export-batch", Some(&request)).await?;
+    let file_name = data
+        .get("fileName")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("agent2api-accounts.json")
+        .to_string();
+    let zip = data.get("mime").and_then(Value::as_str) == Some("application/zip");
+    let encoded = data
+        .get("contentBase64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "批量导出响应缺少内容".to_string())?;
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|_| "批量导出内容不是合法的 base64".to_string())?;
+    let summary = json!({
+        "count": data.get("count").cloned().unwrap_or(Value::from(0)),
+        "fileName": file_name,
+        "failed": data.get("failed").cloned().unwrap_or(Value::Array(Vec::new())),
+        "deleted": Value::Array(Vec::new()),
+        "deleteFailed": Value::Array(Vec::new()),
+    });
+    let exported: Vec<String> = data
+        .get("exportedIds")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let delete_after = payload
+        .get("deleteAfter")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title("批量导出账号")
+        .set_file_name(&file_name);
+    dialog = if zip {
+        dialog.add_filter("ZIP", &["zip"])
+    } else {
+        dialog.add_filter("JSON", &["json"])
+    };
+    let Some(target) = dialog.blocking_save_file() else {
+        return Ok(json!({ "canceled": true }));
+    };
+    let path = target
+        .into_path()
+        .map_err(|error| format!("保存路径无效: {error}"))?;
+    let path = tauri::async_runtime::spawn_blocking(move || std::fs::write(&path, &bytes).map(|_| path))
+        .await
+        .map_err(|error| format!("批量导出任务失败: {error}"))?
+        .map_err(|error| format!("写入账号文件失败: {error}"))?;
+    let mut result = summary;
+    result["file"] = Value::String(path.to_string_lossy().to_string());
+    result["saved"] = Value::Bool(true);
+    if delete_after && !exported.is_empty() {
+        let removed = gateway::call(
+            "POST",
+            "/api/accounts/batch",
+            Some(&json!({ "action": "remove", "ids": exported })),
+        )
+        .await?;
+        result["deleted"] = removed
+            .get("removed")
+            .cloned()
+            .unwrap_or(Value::Array(Vec::new()));
+        result["deleteFailed"] = removed
+            .get("failed")
+            .cloned()
+            .unwrap_or(Value::Array(Vec::new()));
+    }
+    Ok(result)
 }

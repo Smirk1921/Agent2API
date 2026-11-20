@@ -1315,6 +1315,9 @@ pub fn shim_js() -> &'static str {
     export_account_files: function (args) {
       return exportAccountFilesViaDownload(args && args.selection);
     },
+    batch_export_accounts: function (args) {
+      return batchExportAccountsViaDownload(args && args.payload);
+    },
     export_logs: function (args) {
       return downloadFile('GET', '/api/logs/download' + toQuery(args && args.query), 'agent2api-logs.jsonl');
     },
@@ -1377,6 +1380,49 @@ pub fn shim_js() -> &'static str {
       }
     }
     return { total: data.total, count: count, failed: failed, downloadStarted: count > 0 };
+  }
+
+  /**
+   * 批量导出（网页端）：一个请求拿回成品字节（base64），再落成一次浏览器下载。
+   *
+   * 返回形状与桌面壳 `batch_export_accounts` 对齐：`{ count, fileName, failed,
+   * deleted, deleteFailed, downloadStarted }`。删除发生在服务端（`deleteAfter`），
+   * 这里只负责把「哪些删掉了 / 哪些没删掉」原样带回给界面。
+   */
+  async function batchExportAccountsViaDownload(payload) {
+    var body = payload || {};
+    var ids = Array.isArray(body.ids) ? body.ids.map(function (id) { return String(id); }) : [];
+    var data = await call('POST', '/api/accounts/export-batch', {
+      ids: ids,
+      mode: body.mode === 'separate' ? 'separate' : 'combined',
+      // 先导出、落盘成功后再删（见下方），避免响应中断时账号没了、文件也没拿到
+      deleteAfter: false,
+    });
+    if (!data || typeof data.contentBase64 !== 'string' || !data.contentBase64) {
+      throw new Error('批量导出响应格式无效');
+    }
+    var binary = atob(data.contentBase64);
+    var bytes = new Uint8Array(binary.length);
+    for (var index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+    var blob = new Blob([bytes], { type: data.mime || 'application/octet-stream' });
+    saveBlob(blob, data.fileName || 'agent2api-accounts.json');
+    var deleted = [];
+    var deleteFailed = [];
+    var exported = Array.isArray(data.exportedIds) ? data.exportedIds : [];
+    if (body.deleteAfter === true && exported.length) {
+      var removed = await call('POST', '/api/accounts/batch', { action: 'remove', ids: exported });
+      var ok = removed && Array.isArray(removed.removed) ? removed.removed : [];
+      deleted = ok.map(function (item) { return String((item && item.id) || ''); }).filter(Boolean);
+      deleteFailed = removed && Array.isArray(removed.failed) ? removed.failed : [];
+    }
+    return {
+      count: Number(data.count) || 0,
+      fileName: data.fileName || '',
+      failed: Array.isArray(data.failed) ? data.failed : [],
+      deleted: deleted,
+      deleteFailed: deleteFailed,
+      downloadStarted: true,
+    };
   }
 
   /** 面板 / API Key 的请求头（下载、上传这类非 JSON 请求共用） */
@@ -2554,6 +2600,7 @@ pub fn shim_js() -> &'static str {
     },
     exportAccounts: function () { return invokeShell('export_accounts'); },
     exportAccountFiles: function (selection) { return invokeShell('export_account_files', { selection: selection }); },
+    batchExportAccounts: function (payload) { return invokeShell('batch_export_accounts', { payload: payload }); },
     importAccounts: function () { return invokeShell('import_accounts'); },
 
     // ── 整库备份 / 恢复 ──

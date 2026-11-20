@@ -366,6 +366,30 @@ CREATE TABLE IF NOT EXISTS main.codearts_refresh_slots (
 ) WITHOUT ROWID;
 ";
 
+/// CodeArts 换票结果的耐久日志：上游已轮换、本地结算失败时的恢复来源。
+///
+/// 与槽表同一形态（按需建表、不改 user_version）。一行一个账号，记录本次换票的
+/// Pending 操作/代次/账号版本，payload 是加密后的上游凭证 JSON。恢复流程只在账号
+/// 版本与槽仍指向同一次 Pending 时使用它完成结算，绝不重发旧刷新令牌。
+pub(crate) const CODEARTS_REFRESH_RESULT_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS main.codearts_refresh_results (
+  account_id TEXT NOT NULL PRIMARY KEY
+    CHECK (typeof(account_id) = 'text' AND octet_length(account_id) BETWEEN 1 AND 512),
+  operation TEXT NOT NULL
+    CHECK (typeof(operation) = 'text' AND octet_length(operation) BETWEEN 1 AND 128),
+  generation TEXT NOT NULL
+    CHECK (typeof(generation) = 'text' AND octet_length(generation) BETWEEN 1 AND 128),
+  db_epoch TEXT NOT NULL
+    CHECK (typeof(db_epoch) = 'text' AND octet_length(db_epoch) BETWEEN 1 AND 128),
+  born TEXT NOT NULL
+    CHECK (typeof(born) = 'text' AND octet_length(born) BETWEEN 1 AND 128),
+  revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision > 0),
+  payload TEXT NOT NULL
+    CHECK (typeof(payload) = 'text' AND octet_length(payload) BETWEEN 1 AND 196608),
+  created_at INTEGER NOT NULL CHECK (typeof(created_at) = 'integer')
+) WITHOUT ROWID;
+";
+
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
 /// 为什么把六张表写成一个 batch 而不是每张一个常量再拼：它们共同构成「版本 1

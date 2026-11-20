@@ -327,6 +327,28 @@ export type AccountExportResult = {
   downloadStarted?: boolean
 }
 
+/** 批量导出：`combined` = 一个可导入的合并文件，`separate` = 每账号一个 JSON 打包成 zip */
+export type BatchExportMode = 'combined' | 'separate'
+
+export type BatchExportPayload = {
+  ids: string[]
+  mode: BatchExportMode
+  /** 导出成功后删除成功导出的账号；删除失败逐条回报，不影响导出结果 */
+  deleteAfter?: boolean
+}
+
+export type BatchExportResult = {
+  canceled?: boolean
+  count?: number
+  fileName?: string
+  failed?: Array<{ id?: string; name?: string; error?: string }>
+  deleted?: string[]
+  deleteFailed?: Array<{ id?: string; error?: string }>
+  file?: string
+  saved?: boolean
+  downloadStarted?: boolean
+}
+
 export type AccountsBridge = {
   platform?: string
   getAccounts(query?: Record<string, string | number>): Promise<AccountsSnapshot>
@@ -334,6 +356,8 @@ export type AccountsBridge = {
   getAccountSelection(query: AccountListQuery): Promise<{ ids: string[]; total: number }>
   getAccount(id: string): Promise<AccountRecord>
   exportAccountFiles(selection: AccountExportSelection): Promise<AccountExportResult | null | undefined>
+  /** 批量导出（合并 / 逐账号 zip，可选导出后删除）；旧壳没有这个方法时为 undefined */
+  batchExportAccounts?(payload: BatchExportPayload): Promise<BatchExportResult | null | undefined>
   getAccountConnections(): Promise<{ counts?: Record<string, unknown> } | null | undefined>
   updateAccount(id: string, patch: Record<string, unknown>): Promise<AccountUpdateResult | null | undefined>
   /** 整队重排（分组模式）：把新队列整条交上去（从队首到队尾的 id 数组） */

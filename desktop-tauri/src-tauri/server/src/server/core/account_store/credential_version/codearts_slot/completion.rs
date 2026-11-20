@@ -123,7 +123,16 @@ impl PendingSlot {
         credentials: &Value,
     ) -> Result<PendingCompletion, Error> {
         let preparation = slots::prepare_replacement(credentials);
-        let key = cached_key()?;
+        // 密钥不可用同样属于“本次无法收尾”：先按原 Pending 落 Blocked 再返回错误。
+        // 直接 `?` 会丢掉 PendingSlot，槽永久停在 Pending：之后任何续期都只得到
+        // 「上次续期未确认」，而这条账号在上游可能已经消耗过一次刷新令牌。
+        let key = match cached_key() {
+            Ok(key) => key,
+            Err(error) => {
+                let _ = self.block();
+                return Err(error);
+            }
+        };
         Ok(PendingCompletion {
             owner: self,
             preparation: Mutex::new(Some(preparation)),
@@ -139,6 +148,16 @@ impl PendingCompletion {
 
     pub(crate) fn account(&self) -> &str {
         self.owner.account()
+    }
+
+    /// 完成阶段失败后的固定收尾：把本对象持有的原 Pending 落为 Blocked。
+    ///
+    /// 为什么不直接丢弃：Pending 是“已入场、结果未确认”的持久事实。丢掉本对象只会
+    /// 把槽留在 Pending —— 后续续期连重试资格都没有，用户看到的是永久“未确认”。
+    /// 落 Blocked 至少给出明确终态（需要重新授权）；若本次提交其实已经成功、槽已
+    /// 被结算或版本已变化，`block` 会明确失败，不会覆盖已结算状态。
+    pub(crate) fn block(self) -> Result<CodeArtsTransaction<(), SlotFailure>, Error> {
+        self.owner.block()
     }
 
     /// 仅原Call专用保存门；consume只能同步布尔准入，不得SQL/网络/await/spawn/反向锁。

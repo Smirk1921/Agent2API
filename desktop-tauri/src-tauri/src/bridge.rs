@@ -1058,6 +1058,7 @@ const BRIDGE_JS: &str = r#"
     saveAppSettings: patch => invoke('save_app_settings', { patch }),
     exportAccounts: () => invoke('export_accounts'),
     exportAccountFiles: selection => invoke('export_account_files', { selection }),
+    batchExportAccounts: payload => invoke('batch_export_accounts', { payload }),
     importAccounts: () => invoke('import_accounts'),
     // ── 整库备份 / 恢复（设置页「整库备份 / 恢复」）──
     // 文件由后端按壳选的路径直读直写（见 api/backup_api.rs），壳只负责

@@ -578,6 +578,16 @@ impl ServerState {
             // 之后的那一次仍由 `api::upgrade_api` 补调，顺序不变。
         }
 
+        // 上次进程若在上游换票成功之后、本地结算之前退出，耐久日志里会留下完整响应；
+        // 这里在开始服务前把它补完，避免等待下一次维护周期。
+        let recovered = store.recover_codearts_refresh_results();
+        if recovered > 0 {
+            crate::server::logging::log(
+                "[Accounts]",
+                &format!("CodeArts 换票结果恢复：完成 {recovered} 个账号"),
+            );
+        }
+
         let state = Self {
             port,
             panel_port: None,

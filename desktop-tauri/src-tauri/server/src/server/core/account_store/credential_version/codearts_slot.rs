@@ -222,6 +222,20 @@ impl PendingSlot {
             |conn, _| slots::block(conn, &key, &self.original.inner, &self.write),
         ))
     }
+
+    /// **仅在请求确定未发出时**把本次 Pending 回退为 Ready（不推进账号版本）。
+    ///
+    /// 与 [`Self::block`] 一样的收据绑定：只认同一次 Pending 的 operation/generation。
+    /// 调用方必须先证明没有执行 HTTP 请求 —— 上游未消费刷新令牌，回退是安全的；
+    /// 一旦请求可能已发出，只能 `block()`，绝不能回退（否则同一 RT 可能被用两次）。
+    pub(crate) fn cancel_pre_send(self) -> Result<CodeArtsTransaction<(), SlotFailure>, Error> {
+        let key = cached_key()?;
+        Ok(original_transaction(
+            &self.original.store,
+            &self.original.source,
+            |conn, _| slots::cancel_pending(conn, &key, &self.original.inner, &self.write),
+        ))
+    }
 }
 
 fn blocked_result(
@@ -344,4 +358,147 @@ fn original_transaction<T>(
     drop(retained);
     drop([action_unwind, outer_unwind]);
     outcome
+}
+
+fn journal_error(error: Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(format!("{error:?}").into())
+}
+
+impl PendingSlot {
+    /// 本次 Pending 的操作 id（恢复日志与槽绑定用）。
+    pub(crate) fn operation_id(&self) -> String {
+        self.write.operation().to_string()
+    }
+
+    /// 把本次上游响应落盘为恢复日志；失败返回 false（调用方据此决定失败时是否 Blocked）。
+    ///
+    /// 写在“发送成功、结算之前”：一次真正的 Pending 收据（operation/generation）
+    /// 与账号版本一并记录，恢复时只有三者仍一致才允许使用这份响应。
+    pub(crate) fn journal_refresh_result(&self, credentials: &Value) -> bool {
+        let Ok(key) = cached_key() else { return false };
+        let account = self.account().to_string();
+        let operation = self.write.operation().to_string();
+        let generation = self.write.generation().to_string();
+        let version = self.original.inner.version().clone();
+        let store = self.original.store.clone();
+        store
+            .with_lock(|guard| {
+                store.with_conn_mut(guard, |conn| {
+                    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    sql::credential_version::codearts_result::put(
+                        &tx,
+                        &key,
+                        &account,
+                        &operation,
+                        &generation,
+                        &version,
+                        credentials,
+                    )
+                    .map_err(journal_error)?;
+                    tx.commit()
+                })
+            })
+            .is_ok()
+    }
+}
+
+impl AccountStore {
+    /// 结算成功后删除恢复日志（best effort；残留行会被恢复流程判为陈旧并清理）。
+    pub(crate) fn clear_codearts_refresh_result(&self, account: &str, operation: &str) -> bool {
+        self.with_lock(|guard| {
+            self.with_conn_mut(guard, |conn| {
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                sql::credential_version::codearts_result::delete(&tx, account, operation)
+                    .map_err(journal_error)?;
+                tx.commit()
+            })
+        })
+        .is_ok()
+    }
+
+    /// 启动与维护周期调用：把耐久日志里尚未结算的换票结果补完。
+    ///
+    /// 只在账号版本、槽的 operation/generation/版本完全一致时结算；其余一律判陈旧并
+    /// 删除记录。返回本次真正完成的账号数。
+    ///
+    /// **日志必须等事务结束再写**：`logging::log` 会往同一个库追加日志行，
+    /// 在 IMMEDIATE 事务内调用会让它去抢本连接已持有的写锁，启动期直接卡死
+    /// （SCM 30 秒超时后服务起不来）。所以循环里只收集文案，锁释放后再落日志。
+    pub(crate) fn recover_codearts_refresh_results(&self) -> usize {
+        let Ok(key) = cached_key() else { return 0 };
+        let mut completed = 0usize;
+        let mut messages: Vec<String> = Vec::new();
+        let outcome = self.with_lock(|guard| {
+            self.with_conn_mut(guard, |conn| {
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let entries =
+                    sql::credential_version::codearts_result::list(&tx, &key).map_err(journal_error)?;
+                for entry in &entries {
+                    match slots::recover_one(&tx, &key, entry) {
+                        Ok(slots::Recovery::Completed) => {
+                            completed += 1;
+                            messages.push(format!(
+                                "CodeArts 换票结果恢复：账号 {} 已补结算",
+                                entry.account
+                            ));
+                            sql::credential_version::codearts_result::delete(
+                                &tx,
+                                &entry.account,
+                                &entry.operation,
+                            )
+                            .map_err(journal_error)?;
+                        }
+                        Ok(slots::Recovery::Discarded) => {
+                            messages.push(format!(
+                                "CodeArts 换票结果恢复：账号 {} 的记录已陈旧（账号/槽版本已变），丢弃",
+                                entry.account
+                            ));
+                            sql::credential_version::codearts_result::delete(
+                                &tx,
+                                &entry.account,
+                                &entry.operation,
+                            )
+                            .map_err(journal_error)?;
+                        }
+                        Ok(slots::Recovery::Failed(error)) => {
+                            messages.push(format!(
+                                "CodeArts 换票结果恢复：账号 {} 补结算失败（{}），槽已封锁",
+                                entry.account,
+                                error.reason()
+                            ));
+                            sql::credential_version::codearts_result::delete(
+                                &tx,
+                                &entry.account,
+                                &entry.operation,
+                            )
+                            .map_err(journal_error)?;
+                        }
+                        // 读/写失败：保留该行，等下一轮恢复，绝不丢弃唯一副本。
+                        Err(error) => {
+                            messages.push(format!(
+                                "CodeArts 换票结果恢复：账号 {} 本轮无法恢复（{error:?}），保留记录",
+                                entry.account
+                            ));
+                        }
+                    }
+                }
+                tx.commit()
+            })
+        });
+        if let Err(error) = &outcome {
+            messages.push(format!(
+                "CodeArts 换票结果恢复：本轮事务失败，记录保留（{}）",
+                error.message
+            ));
+        }
+        for message in messages {
+            crate::server::logging::log("[Accounts]", &message);
+        }
+        if completed > 0 {
+            if let Some(db) = self.database() {
+                db.invalidate_accounts();
+            }
+        }
+        completed
+    }
 }

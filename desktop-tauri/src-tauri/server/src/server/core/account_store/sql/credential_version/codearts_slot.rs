@@ -10,7 +10,8 @@ use rusqlite::Connection;
 use serde_json::{Map, Value};
 use zeroize::Zeroizing;
 
-use super::{bounded, storage, CommitReceipt, Error, Stamp, StorageFailure, Version};
+use super::projection::Projection;
+use super::{bounded, storage, CommitReceipt, Conflict, Error, Stamp, StorageFailure, Version};
 use crate::server::core::account_store::state::StoredAccount;
 use record::{Slot, State};
 
@@ -32,6 +33,23 @@ pub(crate) enum SlotFailure {
 impl From<Error> for SlotFailure {
     fn from(error: Error) -> Self {
         Self::Account(error)
+    }
+}
+
+impl SlotFailure {
+    /// 恢复日志用的稳定短标签；不输出任何凭证/账号内容。
+    pub(in crate::server::core::account_store) fn reason(&self) -> &'static str {
+        match self {
+            Self::Account(_) => "account-storage",
+            Self::Schema => "slot-schema",
+            Self::Missing => "slot-missing",
+            Self::Invalid => "slot-invalid",
+            Self::NotReady => "slot-not-ready",
+            Self::ReceiptChanged => "receipt-changed",
+            Self::RequiresNewAuthorization => "requires-new-authorization",
+            Self::IncompleteReplacement => "incomplete-replacement",
+            Self::Interrupted => "interrupted",
+        }
     }
 }
 
@@ -268,6 +286,30 @@ pub(in crate::server::core::account_store) fn block(
     let mut slot = pending_slot(conn, key, stamp, pending)?;
     slot.state = State::Blocked {
         operation: pending.operation.clone(),
+    };
+    record::update(conn, key, &slot)
+}
+
+/// 请求确定**尚未发出**时的安全回退：Pending → Ready。
+///
+/// 调用方必须先证明 HTTP 请求没有执行（例如在 `execute` 之前就失败）：
+/// 此时上游没有消费刷新令牌，账号材料不需要推进版本，只需把槽恢复成
+/// 新代次的 Ready，下一次维护可以继续尝试。与 block 一样，必须持本次
+/// Pending 的唯一收据（operation/generation 与槽一致），否则拒绝。
+pub(in crate::server::core::account_store) fn cancel_pending(
+    conn: &Connection,
+    key: &[u8; 32],
+    stamp: &Stamp,
+    pending: &PendingWrite,
+) -> Result<(), SlotFailure> {
+    let mut slot = pending_slot(conn, key, stamp, pending)?;
+    let next = storage::random_id()?;
+    if next == slot.generation || next == pending.operation {
+        return Err(Error::Storage(StorageFailure::RandomUnavailable).into());
+    }
+    slot.generation = next;
+    slot.state = State::Ready {
+        settled_operation: Some(pending.operation.clone()),
     };
     record::update(conn, key, &slot)
 }
@@ -665,4 +707,89 @@ fn replacement_text<'a>(
         }
     }
     found.ok_or(SlotFailure::IncompleteReplacement)
+}
+
+/// 换票结果恢复的结论：完成结算 / 判定陈旧并丢弃 / 无法恢复（槽已落 Blocked）。
+pub(in crate::server::core::account_store) enum Recovery {
+    Completed,
+    Discarded,
+    Failed(SlotFailure),
+}
+
+impl PendingWrite {
+    pub(in crate::server::core::account_store) fn operation(&self) -> &str {
+        &self.operation
+    }
+
+    pub(in crate::server::core::account_store) fn generation(&self) -> &str {
+        &self.generation
+    }
+}
+
+/// 用耐久日志里的一次上游响应补完结算。
+///
+/// 只在账号版本、槽的 operation/generation/版本全部仍指向同一次 Pending 时执行；
+/// 其余情形一律判陈旧并交由调用方删除记录——绝不重发旧刷新令牌，也不猜测代次。
+pub(in crate::server::core::account_store) fn recover_one(
+    conn: &Connection,
+    key: &[u8; 32],
+    entry: &super::codearts_result::Entry,
+) -> Result<Recovery, Error> {
+    if conn.is_autocommit() {
+        return Err(Error::Storage(StorageFailure::Begin));
+    }
+    let account = match storage::load(conn, key, &entry.account) {
+        Ok(account) => account,
+        Err(Error::Conflict(Conflict::MissingAccount)) => return Ok(Recovery::Discarded),
+        // 存储/解密失败不是“陈旧”：保留日志等下一轮，绝不因一次读失败丢掉唯一副本。
+        Err(error) => return Err(error),
+    };
+    let Some(version) = storage::version(&account)? else {
+        return Ok(Recovery::Discarded);
+    };
+    if version != entry.version {
+        return Ok(Recovery::Discarded);
+    }
+    let slot = match record::load(conn, key, &entry.account) {
+        Ok(slot) => slot,
+        Err(SlotFailure::Account(error)) => return Err(error),
+        Err(_) => return Ok(Recovery::Discarded),
+    };
+    match &slot.state {
+        // 已经结算过（槽版本不落后）：日志只是没删掉。
+        State::Ready { .. } if slot.revision >= version.revision => return Ok(Recovery::Discarded),
+        State::Pending { operation }
+            if operation == &entry.operation
+                && slot.generation == entry.generation
+                && slot.revision == version.revision
+                && slot.born == version.born
+                && slot.db_epoch == version.epoch => {}
+        _ => return Ok(Recovery::Discarded),
+    }
+    let projection = Projection::read(&account)?;
+    let stamp = Stamp {
+        id: entry.account.clone(),
+        version: version.clone(),
+        projection,
+    };
+    let pending = PendingWrite {
+        generation: entry.generation.clone(),
+        operation: entry.operation.clone(),
+    };
+    let replacement = match prepare_replacement(&entry.body) {
+        Ok(replacement) => replacement,
+        Err(error) => {
+            let _ = block(conn, key, &stamp, &pending);
+            return Ok(Recovery::Failed(error));
+        }
+    };
+    let mut retained = RetainedRows::new();
+    match complete(conn, key, &stamp, &pending, &replacement, &mut retained) {
+        Ok(Settlement::Rotated(_)) => Ok(Recovery::Completed),
+        Ok(Settlement::Blocked(error)) => Ok(Recovery::Failed(error)),
+        Err(error) => {
+            let _ = block(conn, key, &stamp, &pending);
+            Ok(Recovery::Failed(error))
+        }
+    }
 }
