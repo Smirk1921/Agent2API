@@ -3,6 +3,7 @@
 //! 不使用任务层只读ROLLBACK入口。COMMIT错误独立报告，不能推断已/未保存。
 
 mod bounded;
+pub(in crate::server::core::account_store) mod codearts_result;
 pub(in crate::server::core::account_store) mod codearts_slot;
 pub(in crate::server::core::account_store) mod codearts_enrollment;
 pub(in crate::server::core::account_store) mod cline_free_enrollment;
@@ -84,13 +85,17 @@ impl Stamp {
         &self.id
     }
 
+    pub(in crate::server::core::account_store) fn version(&self) -> &Version {
+        &self.version
+    }
+
     pub(in crate::server::core::account_store) fn secret(&self) -> &Value {
         self.projection.secret()
     }
 }
 
-#[derive(PartialEq, Eq)]
-struct Version {
+#[derive(Clone, PartialEq, Eq)]
+pub(in crate::server::core::account_store) struct Version {
     epoch: String,
     born: String,
     revision: u64,

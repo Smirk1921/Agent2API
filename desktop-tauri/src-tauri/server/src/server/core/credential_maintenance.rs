@@ -128,6 +128,19 @@ pub async fn refresh_selected_accounts(store: &AccountStore, selected: Option<&[
 }
 
 pub async fn refresh_accounts(store: &AccountStore, selected: Option<&[String]>, forced: &[String]) -> Vec<Value> {
+    // 先补完上次“上游已换票、本地未结算”的恢复日志，再进入本轮刷新。
+    let recovered = {
+        let store = store.clone();
+        crate::server::core::blocking::run(move || store.recover_codearts_refresh_results())
+            .await
+            .unwrap_or(0)
+    };
+    if recovered > 0 {
+        logging::log(
+            "[Accounts]",
+            &format!("CodeArts 换票结果恢复：完成 {recovered} 个账号"),
+        );
+    }
     let before = crate::server::core::maintenance::types::accounts(store);
     let snapshot = store.list_accounts();
     let accounts: Vec<Value> = snapshot

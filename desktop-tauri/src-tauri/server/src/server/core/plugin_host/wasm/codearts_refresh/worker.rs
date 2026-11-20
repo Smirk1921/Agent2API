@@ -204,28 +204,36 @@ async fn run(owner: &mut Ownership) -> Result<Value, proto::WireError> {
     if call.with_current(|| Ok(())).is_err() { return block(owner).await; }
     let candidate = owner.candidate.take().ok_or_else(unknown)?;
     let pending = owner.pending.take().ok_or_else(unknown)?;
+    let journal_account = pending.account().to_string();
+    let journal_operation = pending.operation_id();
     let original = call.clone();
     let operation = owner.operation.clone();
     let result = tokio::task::spawn_blocking(move || {
-        // 本段一旦拿到 pending，任何失败都必须把它落为 Blocked：
-        // 直接丢弃只会把槽留在 Pending，而这条账号在上游可能已经换过票 ——
-        // 新令牌随候选一起消失，旧令牌作废，之后永远是「上次续期未确认」。
+        // 先把上游响应落盘为恢复日志：此后任何结算失败都能在恢复流程里补完，
+        // 新令牌不再只存在于内存。落盘失败时退回“失败即 Blocked”的旧纪律。
+        let journaled = pending.journal_refresh_result(candidate.credentials());
         let access = match candidate.credentials()["access_key_id"].as_str() {
             Some(access) => Zeroizing::new(access.to_string()),
             None => {
-                let _ = pending.block();
+                if !journaled {
+                    let _ = pending.block();
+                }
                 return Err(unknown());
             }
         };
         let completion = match pending.prepare_completion(candidate.credentials()) {
             Ok(completion) => completion,
-            // prepare_completion 内部已按同一纪律落 Blocked。
+            // prepare_completion 在密钥不可用时已自行落 Blocked。
             Err(_) => return Err(unknown()),
         };
         let checked = match original.complete_pending_once(&completion) {
             Ok(checked) => checked,
             Err(error) => {
-                let _ = completion.block();
+                // 有日志时保留 Pending：恢复流程会用同一份响应补完；
+                // 没有日志才封锁，避免留下无法恢复的悬挂 Pending。
+                if !journaled {
+                    let _ = completion.block();
+                }
                 return Err(error);
             }
         };
@@ -241,11 +249,17 @@ async fn run(owner: &mut Ownership) -> Result<Value, proto::WireError> {
             PendingCompletionState::Entered {
                 result: PendingCompletionCallback::Returned(Ok(SlotSettlement::Rotated(_))),
                 commit: PendingCommitFact::Confirmed, storage_closed: true,
-            } => Ok(Value::String(access.to_string())),
+            } => {
+                if let Some(store) = plugin_accounts::shared() {
+                    store.clear_codearts_refresh_result(&journal_account, &journal_operation);
+                }
+                Ok(Value::String(access.to_string()))
+            }
             _ => {
                 original.close();
-                // 提交未确认 / 被拒时同样收尾成 Blocked，不让 Pending 悬挂。
-                let _ = completion.block();
+                if !journaled {
+                    let _ = completion.block();
+                }
                 Err(unknown())
             }
         }
