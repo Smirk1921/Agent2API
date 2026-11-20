@@ -256,7 +256,37 @@ pub async fn refresh_accounts(store: &AccountStore, selected: Option<&[String]>,
         // 不会中断循环（见模块头的失败隔离）。
         let started = std::time::Instant::now();
         let credential_stamp = store.credential_stamp(&id);
-        let result = refresh_checked(store, adapter.as_ref(), &id).await.map(|_| ());
+        // 发送前的本地失败（egress/插件调用/材料构造）不消费 RT、槽仍是 Ready，
+        // 属于可重试的瞬时故障。批量维护里一次性把 11 个账号判死没有意义 ——
+        // 换个时间点再试往往就好了。只重试这些阶段码，`send_failed` 不重试
+        // （请求可能已经发出，重复发送会用掉同一枚 RT）。
+        const TRANSIENT_PRE_SEND_CODES: &[&str] = &[
+            "codearts_refresh_egress_failed",
+            "codearts_refresh_request_failed",
+            "codearts_refresh_material_failed",
+            "codearts_refresh_call_stale",
+            "codearts_refresh_read_failed",
+            "codearts_refresh_random_failed",
+            "codearts_refresh_unavailable",
+        ];
+        let mut attempts = 0usize;
+        let result = loop {
+            attempts += 1;
+            let attempt = refresh_checked(store, adapter.as_ref(), &id).await.map(|_| ());
+            let transient = attempt
+                .as_ref()
+                .err()
+                .and_then(|error| error.code.as_deref())
+                .is_some_and(|code| TRANSIENT_PRE_SEND_CODES.contains(&code));
+            if !transient || attempts >= 3 {
+                break attempt;
+            }
+            logging::verbose(
+                "[Accounts]",
+                &format!("账号 {id} 刷新在发送前失败，{} 秒后重试（第 {attempts} 次）", attempts),
+            );
+            tokio::time::sleep(Duration::from_secs(attempts as u64)).await;
+        };
         let mut row = match &result {
             Ok(_) => json!({
                 "id": id,

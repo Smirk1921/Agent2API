@@ -147,59 +147,74 @@ pub(super) async fn exchange(call: Arc<Call>) -> Result<Value, proto::WireError>
 }
 
 async fn run(owner: &mut Ownership) -> Result<Value, proto::WireError> {
-    let call = owner.call.as_ref().cloned().ok_or_else(unknown)?;
-    let store = plugin_accounts::shared().ok_or_else(unknown)?;
-    call.with_current(|| Ok(()))?;
+    let call = owner.call.as_ref().cloned().ok_or_else(|| stage("codearts_refresh_unavailable"))?;
+    let store = plugin_accounts::shared().ok_or_else(|| stage("codearts_refresh_unavailable"))?;
+    call.with_current(|| Ok(())).map_err(|_| stage("codearts_refresh_call_stale"))?;
     let account = call.account().to_string();
     let result = tokio::task::spawn_blocking(move || store.read_codearts_ready(&account)).await
-        .map_err(|_| unknown())?.map_err(|_| unknown())?;
-    owner.ready = match result { SlotOutcome::Committed(ready) => Some(ready), _ => return Err(unknown()) };
-    call.with_current(|| Ok(()))?;
-    let material = RefreshMaterial::from_stamp(owner.ready.as_ref().ok_or_else(unknown)?.borrow_stamp())
-        .map_err(|_| unknown())?;
+        .map_err(|_| stage("codearts_refresh_read_failed"))?
+        .map_err(|_| stage("codearts_refresh_read_failed"))?;
+    owner.ready = match result {
+        SlotOutcome::Committed(ready) => Some(ready),
+        _ => return Err(stage("codearts_refresh_not_ready")),
+    };
+    call.with_current(|| Ok(())).map_err(|_| stage("codearts_refresh_call_stale"))?;
+    let material = RefreshMaterial::from_stamp(owner.ready.as_ref().ok_or_else(|| stage("codearts_refresh_material_failed"))?.borrow_stamp())
+        .map_err(|_| stage("codearts_refresh_material_failed"))?;
     let mut jti = [0u8; 32];
-    getrandom::getrandom(&mut jti).map_err(|_| unknown())?;
-    owner.parts = Some(material.build(crate::server::logging::now_ms(), jti).map_err(|_| unknown())?);
-    let path = call.take_path(owner.ready.as_ref().ok_or_else(unknown)?)?;
+    getrandom::getrandom(&mut jti).map_err(|_| stage("codearts_refresh_random_failed"))?;
+    owner.parts = Some(material.build(crate::server::logging::now_ms(), jti)
+        .map_err(|_| stage("codearts_refresh_material_failed"))?);
+    let path = call.take_path(owner.ready.as_ref().ok_or_else(|| stage("codearts_refresh_request_failed"))?)?;
     owner.client = Some(tokio::time::timeout_at(call.deadline().min(Instant::now() + Duration::from_secs(5)),
-        FrozenHttpClient::from_path(path)).await.map_err(|_| unknown())?.map_err(|_| unknown())?);
-    let parts = owner.parts.as_ref().ok_or_else(unknown)?;
-    let client = owner.client.as_ref().ok_or_else(unknown)?;
-    let mut request = client.client().map_err(|_| unknown())?.post(parts.uri());
+        FrozenHttpClient::from_path(path)).await
+        .map_err(|_| stage("codearts_refresh_egress_failed"))?
+        .map_err(|_| stage("codearts_refresh_egress_failed"))?);
+    let parts = owner.parts.as_ref().ok_or_else(|| stage("codearts_refresh_request_failed"))?;
+    let client = owner.client.as_ref().ok_or_else(|| stage("codearts_refresh_request_failed"))?;
+    let mut request = client.client().map_err(|_| stage("codearts_refresh_egress_failed"))?.post(parts.uri());
     for (name, value) in parts.headers() { request = request.header(name, value); }
-    let request = request.body(parts.form().as_bytes().to_vec()).build().map_err(|_| unknown())?;
+    let request = request.body(parts.form().as_bytes().to_vec()).build()
+        .map_err(|_| stage("codearts_refresh_request_failed"))?;
     if request.method() != reqwest::Method::POST || request.url().as_str() != TOKEN_URI
         || request.body().and_then(reqwest::Body::as_bytes) != Some(parts.form().as_bytes()) {
-        return Err(unknown());
+        return Err(stage("codearts_refresh_request_failed"));
     }
     owner.request = Some(request);
     // 排队等待节拍放在 “Ready→Pending” 之前：等待期间槽仍是 Ready，
     // 进程若在这时退出也不会留下悬挂的 Pending；等待也不计入 HTTP 预算。
     pace_refresh().await;
-    call.with_current(|| Ok(()))?;
-    let ready = owner.ready.take().ok_or_else(unknown)?;
+    call.with_current(|| Ok(())).map_err(|_| stage("codearts_refresh_call_stale"))?;
+    let ready = owner.ready.take().ok_or_else(|| stage("codearts_refresh_request_failed"))?;
     let result = tokio::task::spawn_blocking(move || ready.consume_pending()).await
-        .map_err(|_| unknown())?.map_err(|_| unknown())?;
+        .map_err(|_| stage("codearts_refresh_read_failed"))?
+        .map_err(|_| stage("codearts_refresh_read_failed"))?;
     owner.pending = match result {
         SlotOutcome::Committed(pending) => Some(pending),
         _ => return Err(stage("codearts_refresh_not_ready")),
     };
-    if call.submit_pending_once(owner.pending.as_ref().ok_or_else(unknown)?).is_err() {
+    let pending = owner.pending.as_ref().ok_or_else(unknown)?;
+    let first_submit = call.submit_pending_once(pending).err();
+    if first_submit.is_some() {
         // 收据提交失败发生在任何 HTTP 之前：请求确定没有发出，RT 未被消费。
         // 插件侧用 try_lock 取生命周期锁，争用时是**瞬时**失败；先短暂重试，
         // 仍失败才把槽回退为 Ready —— 不能因为一次锁竞争就把账号封成
         // “上次续期未确认”，那需要人工停服务重置。
+        let mut last_error = first_submit;
         let mut submitted = false;
         for attempt in 0..4 {
             tokio::time::sleep(Duration::from_millis(20 << attempt)).await;
             let Some(pending) = owner.pending.as_ref() else { break };
-            if call.submit_pending_once(pending).is_ok() {
-                submitted = true;
-                break;
+            match call.submit_pending_once(pending) {
+                Ok(()) => {
+                    submitted = true;
+                    break;
+                }
+                Err(error) => last_error = Some(error),
             }
         }
         if !submitted {
-            return cancel_pre_send(owner).await;
+            return cancel_pre_send(owner, last_error).await;
         }
     }
     let request = owner.request.take().ok_or_else(unknown)?;
@@ -208,7 +223,7 @@ async fn run(owner: &mut Ownership) -> Result<Value, proto::WireError> {
         match client.client() {
             Ok(http) => http,
             // 同上：客户端尚未构造出请求，也未发出任何字节。
-            Err(_) => return cancel_pre_send(owner).await,
+            Err(_) => return cancel_pre_send(owner, Some(stage("codearts_refresh_egress_failed"))).await,
         }
     };
     // 25 秒预算只覆盖实际请求（节拍等待已在 Ready→Pending 之前完成）。
@@ -307,7 +322,10 @@ async fn block(owner: &mut Ownership, code: &str) -> Result<Value, proto::WireEr
 }
 
 /// 请求确定未发出时的收尾：Pending 回退为 Ready，并关闭本次插件调用。
-async fn cancel_pre_send(owner: &mut Ownership) -> Result<Value, proto::WireError> {
+async fn cancel_pre_send(
+    owner: &mut Ownership,
+    cause: Option<proto::WireError>,
+) -> Result<Value, proto::WireError> {
     let account = owner.call.as_ref().map(|call| call.account().to_string());
     let label = account.as_deref().unwrap_or("未知账号");
     if let Some(pending) = owner.pending.take() {
@@ -334,7 +352,9 @@ async fn cancel_pre_send(owner: &mut Ownership) -> Result<Value, proto::WireErro
         }
     }
     if let Some(call) = owner.call.take() { call.close(); }
-    Err(stage("codearts_refresh_pre_send"))
+    // 返回真正的触发原因（例如 call_unavailable / call_consumed / egress_unavailable），
+    // 不再统一成 pre_send —— 阶段码是排障的唯一线索。
+    Err(cause.unwrap_or_else(|| stage("codearts_refresh_pre_send")))
 }
 
 fn for_host(host: &crate::server::core::plugin_host::Host) -> Vec<Arc<Operation>> {
