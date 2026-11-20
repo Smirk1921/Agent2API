@@ -222,6 +222,20 @@ impl PendingSlot {
             |conn, _| slots::block(conn, &key, &self.original.inner, &self.write),
         ))
     }
+
+    /// **仅在请求确定未发出时**把本次 Pending 回退为 Ready（不推进账号版本）。
+    ///
+    /// 与 [`Self::block`] 一样的收据绑定：只认同一次 Pending 的 operation/generation。
+    /// 调用方必须先证明没有执行 HTTP 请求 —— 上游未消费刷新令牌，回退是安全的；
+    /// 一旦请求可能已发出，只能 `block()`，绝不能回退（否则同一 RT 可能被用两次）。
+    pub(crate) fn cancel_pre_send(self) -> Result<CodeArtsTransaction<(), SlotFailure>, Error> {
+        let key = cached_key()?;
+        Ok(original_transaction(
+            &self.original.store,
+            &self.original.source,
+            |conn, _| slots::cancel_pending(conn, &key, &self.original.inner, &self.write),
+        ))
+    }
 }
 
 fn blocked_result(

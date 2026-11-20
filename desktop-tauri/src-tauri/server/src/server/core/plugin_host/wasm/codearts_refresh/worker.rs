@@ -180,16 +180,42 @@ async fn run(owner: &mut Ownership) -> Result<Value, proto::WireError> {
     let ready = owner.ready.take().ok_or_else(unknown)?;
     let result = tokio::task::spawn_blocking(move || ready.consume_pending()).await
         .map_err(|_| unknown())?.map_err(|_| unknown())?;
-    owner.pending = match result { SlotOutcome::Committed(pending) => Some(pending), _ => return Err(unknown()) };
+    owner.pending = match result {
+        SlotOutcome::Committed(pending) => Some(pending),
+        _ => return Err(stage("codearts_refresh_not_ready")),
+    };
     if call.submit_pending_once(owner.pending.as_ref().ok_or_else(unknown)?).is_err() {
-        return block(owner).await;
+        // 收据提交失败发生在任何 HTTP 之前：请求确定没有发出，RT 未被消费。
+        // 插件侧用 try_lock 取生命周期锁，争用时是**瞬时**失败；先短暂重试，
+        // 仍失败才把槽回退为 Ready —— 不能因为一次锁竞争就把账号封成
+        // “上次续期未确认”，那需要人工停服务重置。
+        let mut submitted = false;
+        for attempt in 0..4 {
+            tokio::time::sleep(Duration::from_millis(20 << attempt)).await;
+            let Some(pending) = owner.pending.as_ref() else { break };
+            if call.submit_pending_once(pending).is_ok() {
+                submitted = true;
+                break;
+            }
+        }
+        if !submitted {
+            return cancel_pre_send(owner).await;
+        }
     }
     let request = owner.request.take().ok_or_else(unknown)?;
-    let client = owner.client.as_ref().ok_or_else(unknown)?;
+    let http = {
+        let client = owner.client.as_ref().ok_or_else(unknown)?;
+        match client.client() {
+            Ok(http) => http,
+            // 同上：客户端尚未构造出请求，也未发出任何字节。
+            Err(_) => return cancel_pre_send(owner).await,
+        }
+    };
     // 25 秒预算只覆盖实际请求（节拍等待已在 Ready→Pending 之前完成）。
     let deadline = call.deadline().min(Instant::now() + Duration::from_secs(25));
-    let read = tokio::time::timeout_at(deadline, async {
-        let mut response = client.client().map_err(|_| unknown())?.execute(request).await.map_err(|_| unknown())?;
+    let read = tokio::time::timeout_at(deadline, async move {
+        // 到这里才开始真正发送；之后的任何失败都按“可能已发出”处理。
+        let mut response = http.execute(request).await.map_err(|_| unknown())?;
         let status = response.status().as_u16();
         if response.url().as_str() != TOKEN_URI || response.headers().contains_key("location")
             || response.content_length().is_some_and(|length| length > MAX_RESPONSE_BYTES as u64) { return Err(unknown()); }
@@ -200,8 +226,13 @@ async fn run(owner: &mut Ownership) -> Result<Value, proto::WireError> {
         }
         ResponseCandidate::parse(status, &bytes, crate::server::logging::now_ms()).map_err(|_| unknown())
     }).await;
-    owner.candidate = match read { Ok(Ok(candidate)) => Some(candidate), _ => return block(owner).await };
-    if call.with_current(|| Ok(())).is_err() { return block(owner).await; }
+    owner.candidate = match read {
+        Ok(Ok(candidate)) => Some(candidate),
+        _ => return block(owner, "codearts_refresh_send_failed").await,
+    };
+    if call.with_current(|| Ok(())).is_err() {
+        return block(owner, "codearts_refresh_post_response").await;
+    }
     let candidate = owner.candidate.take().ok_or_else(unknown)?;
     let pending = owner.pending.take().ok_or_else(unknown)?;
     let journal_account = pending.account().to_string();
@@ -218,13 +249,13 @@ async fn run(owner: &mut Ownership) -> Result<Value, proto::WireError> {
                 if !journaled {
                     let _ = pending.block();
                 }
-                return Err(unknown());
+                return Err(stage("codearts_refresh_complete_failed"));
             }
         };
         let completion = match pending.prepare_completion(candidate.credentials()) {
             Ok(completion) => completion,
             // prepare_completion 在密钥不可用时已自行落 Blocked。
-            Err(_) => return Err(unknown()),
+            Err(_) => return Err(stage("codearts_refresh_complete_failed")),
         };
         let checked = match original.complete_pending_once(&completion) {
             Ok(checked) => checked,
@@ -260,19 +291,50 @@ async fn run(owner: &mut Ownership) -> Result<Value, proto::WireError> {
                 if !journaled {
                     let _ = completion.block();
                 }
-                Err(unknown())
+                Err(stage("codearts_refresh_complete_failed"))
             }
         }
-    }).await.map_err(|_| unknown())?;
+    }).await.map_err(|_| stage("codearts_refresh_complete_failed"))?;
     result
 }
 
-async fn block(owner: &mut Ownership) -> Result<Value, proto::WireError> {
+async fn block(owner: &mut Ownership, code: &str) -> Result<Value, proto::WireError> {
     if let Some(pending) = owner.pending.take() {
         // 同步存储工作仍由原独立worker等待，取消方不能把它丢弃后重新占槽。
         let _ = tokio::task::spawn_blocking(move || pending.block()).await;
     }
-    Err(unknown())
+    Err(stage(code))
+}
+
+/// 请求确定未发出时的收尾：Pending 回退为 Ready，并关闭本次插件调用。
+async fn cancel_pre_send(owner: &mut Ownership) -> Result<Value, proto::WireError> {
+    let account = owner.call.as_ref().map(|call| call.account().to_string());
+    let label = account.as_deref().unwrap_or("未知账号");
+    if let Some(pending) = owner.pending.take() {
+        let outcome = tokio::task::spawn_blocking(move || pending.cancel_pre_send()).await;
+        let committed = matches!(
+            outcome,
+            Ok(Ok(crate::server::db::CodeArtsTransaction::Committed { .. }))
+        );
+        if committed {
+            // 失败已按“未发送”处理并回退成功：这条是正常自愈，不是故障。
+            crate::server::logging::log(
+                "[Accounts]",
+                &format!("CodeArts 换票在发送前失败，账号 {label} 的续期槽已回退为 Ready，下一轮重试"),
+            );
+        } else {
+            // 回退失败只剩两种结果：槽仍是 Pending（下次报“上次续期未确认”）
+            // 或已被其它操作接手。留一条日志，避免只看到一条 pre_send 失败。
+            crate::server::logging::log(
+                "[Accounts]",
+                &format!(
+                    "CodeArts 换票在发送前失败，但账号 {label} 的续期槽未能回退为 Ready；下次维护会提示“上次续期未确认”"
+                ),
+            );
+        }
+    }
+    if let Some(call) = owner.call.take() { call.close(); }
+    Err(stage("codearts_refresh_pre_send"))
 }
 
 fn for_host(host: &crate::server::core::plugin_host::Host) -> Vec<Arc<Operation>> {
@@ -330,5 +392,13 @@ async fn wait(operation: Arc<Operation>) {
     }
 }
 fn unknown() -> proto::WireError {
-    proto::WireError::with_code("CodeArts本次换证、原槽保存或收尾未确认，未重发、重新占槽或沿用旧值冒充成功", "codearts_refresh_unconfirmed")
+    stage("codearts_refresh_unconfirmed")
+}
+
+/// 统一文案 + 阶段码：`code` 会进日志事件与错误响应，排障时不必再靠耗时猜阶段。
+fn stage(code: &str) -> proto::WireError {
+    proto::WireError::with_code(
+        "CodeArts本次换证、原槽保存或收尾未确认，未重发、重新占槽或沿用旧值冒充成功",
+        code,
+    )
 }

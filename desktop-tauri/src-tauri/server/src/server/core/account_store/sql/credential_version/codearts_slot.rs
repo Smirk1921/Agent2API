@@ -290,6 +290,30 @@ pub(in crate::server::core::account_store) fn block(
     record::update(conn, key, &slot)
 }
 
+/// 请求确定**尚未发出**时的安全回退：Pending → Ready。
+///
+/// 调用方必须先证明 HTTP 请求没有执行（例如在 `execute` 之前就失败）：
+/// 此时上游没有消费刷新令牌，账号材料不需要推进版本，只需把槽恢复成
+/// 新代次的 Ready，下一次维护可以继续尝试。与 block 一样，必须持本次
+/// Pending 的唯一收据（operation/generation 与槽一致），否则拒绝。
+pub(in crate::server::core::account_store) fn cancel_pending(
+    conn: &Connection,
+    key: &[u8; 32],
+    stamp: &Stamp,
+    pending: &PendingWrite,
+) -> Result<(), SlotFailure> {
+    let mut slot = pending_slot(conn, key, stamp, pending)?;
+    let next = storage::random_id()?;
+    if next == slot.generation || next == pending.operation {
+        return Err(Error::Storage(StorageFailure::RandomUnavailable).into());
+    }
+    slot.generation = next;
+    slot.state = State::Ready {
+        settled_operation: Some(pending.operation.clone()),
+    };
+    record::update(conn, key, &slot)
+}
+
 fn current(
     conn: &Connection,
     key: &[u8; 32],
