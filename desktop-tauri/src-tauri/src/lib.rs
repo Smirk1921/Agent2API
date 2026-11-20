@@ -312,6 +312,7 @@ pub fn run() {
             commands::save_app_settings,
             commands::export_accounts,
             account_export::export_account_files,
+            account_export::batch_export_accounts,
             assistant_image::save_assistant_image,
             assistant_image::save_tool_image,
             commands::import_accounts,

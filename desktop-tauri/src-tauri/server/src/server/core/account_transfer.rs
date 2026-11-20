@@ -45,7 +45,10 @@ mod export;
 mod identity;
 mod normalize;
 
-pub use export::{export_account_files, ExportSelection, ACCOUNT_FILE_FORMAT};
+pub use export::{
+    export_account_files, export_batch, BatchExport, BatchExportMode, ExportSelection,
+    ACCOUNT_FILE_FORMAT,
+};
 
 use serde_json::{json, Map, Value};
 

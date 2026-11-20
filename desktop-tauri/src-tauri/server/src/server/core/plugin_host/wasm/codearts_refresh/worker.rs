@@ -183,9 +183,28 @@ async fn run(owner: &mut Ownership) -> Result<Value, proto::WireError> {
     let original = call.clone();
     let operation = owner.operation.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let access = Zeroizing::new(candidate.credentials()["access_key_id"].as_str().ok_or_else(unknown)?.to_string());
-        let completion = pending.prepare_completion(candidate.credentials()).map_err(|_| unknown())?;
-        let checked = original.complete_pending_once(&completion)?;
+        // 本段一旦拿到 pending，任何失败都必须把它落为 Blocked：
+        // 直接丢弃只会把槽留在 Pending，而这条账号在上游可能已经换过票 ——
+        // 新令牌随候选一起消失，旧令牌作废，之后永远是「上次续期未确认」。
+        let access = match candidate.credentials()["access_key_id"].as_str() {
+            Some(access) => Zeroizing::new(access.to_string()),
+            None => {
+                let _ = pending.block();
+                return Err(unknown());
+            }
+        };
+        let completion = match pending.prepare_completion(candidate.credentials()) {
+            Ok(completion) => completion,
+            // prepare_completion 内部已按同一纪律落 Blocked。
+            Err(_) => return Err(unknown()),
+        };
+        let checked = match original.complete_pending_once(&completion) {
+            Ok(checked) => checked,
+            Err(error) => {
+                let _ = completion.block();
+                return Err(error);
+            }
+        };
         let (commit, storage_closed) = checked.facts();
         operation.save_commit.store(match commit {
             PendingCommitFact::NotAttempted => 0,
@@ -194,13 +213,17 @@ async fn run(owner: &mut Ownership) -> Result<Value, proto::WireError> {
         }, Ordering::Release);
         operation.save_storage_closed.store(storage_closed, Ordering::Release);
         let state = checked.into_state();
-        drop(completion);
         match state {
             PendingCompletionState::Entered {
                 result: PendingCompletionCallback::Returned(Ok(SlotSettlement::Rotated(_))),
                 commit: PendingCommitFact::Confirmed, storage_closed: true,
             } => Ok(Value::String(access.to_string())),
-            _ => { original.close(); Err(unknown()) },
+            _ => {
+                original.close();
+                // 提交未确认 / 被拒时同样收尾成 Blocked，不让 Pending 悬挂。
+                let _ = completion.block();
+                Err(unknown())
+            }
         }
     }).await.map_err(|_| unknown())?;
     result

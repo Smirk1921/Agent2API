@@ -424,6 +424,8 @@ pub async fn dispatch(
         ("PUT", "sorting") => return super::accounts_sort::save_sorting(&state, body),
         ("GET", "export") => return export_accounts(&state),
         ("POST", "export-files") => return super::accounts_export::account_files(&state, body).await,
+        // 批量导出（合并 / 逐账号 zip，可选导出后删除）
+        ("POST", "export-batch") => return super::accounts_export::batch_export(&state, body).await,
         ("POST", "import") => return import_accounts(&state, body).await,
         ("POST", "current") => return set_current(&state, body).await,
         ("POST", "batch") => return batch_accounts(&state, body).await,

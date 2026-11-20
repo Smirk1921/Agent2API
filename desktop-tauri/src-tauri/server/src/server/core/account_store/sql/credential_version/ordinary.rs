@@ -346,7 +346,25 @@ pub(in crate::server::core::account_store::sql) fn delete(
         if provider.as_deref().is_some_and(maintained_provider) {
             storage::ensure_no_triggers(conn).map_err(write_error)?;
         }
-        Ok(conn.execute("DELETE FROM main.accounts WHERE id = ?1", [id])? > 0)
+        let removed = conn.execute("DELETE FROM main.accounts WHERE id = ?1", [id])? > 0;
+        // 续期槽是账号的附属行。账号删掉后留下孤儿行，会让同 id 重新导入撞上旧绑定
+        //（槽还停在 Pending/Blocked 时表现为「上次续期未确认」）。与账号行同一事务删除。
+        // 旧库可能还没有这张表（从未登记过 CodeArts），缺表时跳过。
+        if removed {
+            let has_slots: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema
+                    WHERE type = 'table' AND name = 'codearts_refresh_slots')",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_slots {
+                conn.execute(
+                    "DELETE FROM main.codearts_refresh_slots WHERE account_id = ?1",
+                    [id],
+                )?;
+            }
+        }
+        Ok(removed)
     })
 }
 
