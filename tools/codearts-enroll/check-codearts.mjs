@@ -63,8 +63,9 @@ const accounts = rows.map((row) => {
     if (expiresAt) {
       const iso = new Date(expiresAt).toISOString();
       for (const target of [rec, rec.pluginSecret].filter((value) => value && typeof value === 'object')) {
-        if (target.expiration !== undefined && target.expiration !== iso) out.expiryConflict = true;
-        if (target.expires_at !== undefined && target.expires_at !== iso) out.expiryConflict = true;
+        // RFC3339 允许可变小数位（.18Z 与 .180Z 是同一毫秒），按解析后的时间戳比较。
+        if (target.expiration !== undefined && Date.parse(target.expiration) !== expiresAt) out.expiryConflict = true;
+        if (target.expires_at !== undefined && Date.parse(target.expires_at) !== expiresAt) out.expiryConflict = true;
       }
     }
     if (hasSlots) {
