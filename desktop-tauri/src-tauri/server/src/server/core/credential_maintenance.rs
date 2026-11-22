@@ -143,6 +143,21 @@ pub async fn refresh_accounts(store: &AccountStore, selected: Option<&[String]>,
             &format!("CodeArts 换票结果恢复：完成 {recovered} 个账号"),
         );
     }
+    // 自动恢复被封锁的槽：Blocked 只表示「上次操作可能已发出、结果未确认」，
+    // 重试不会造成二次消费；但设 1 小时冷却，避免对真正失效的账号每轮都打上游。
+    const RECLAIM_COOLDOWN_MS: i64 = 60 * 60 * 1000;
+    let reclaimed = {
+        let store = store.clone();
+        crate::server::core::blocking::run(move || store.reclaim_codearts_blocked(RECLAIM_COOLDOWN_MS))
+            .await
+            .unwrap_or(0)
+    };
+    if reclaimed > 0 {
+        logging::log(
+            "[Accounts]",
+            &format!("CodeArts 封锁槽自动恢复：本轮回退 {reclaimed} 个账号"),
+        );
+    }
     let before = crate::server::core::maintenance::types::accounts(store);
     let snapshot = store.list_accounts();
     let accounts: Vec<Value> = snapshot

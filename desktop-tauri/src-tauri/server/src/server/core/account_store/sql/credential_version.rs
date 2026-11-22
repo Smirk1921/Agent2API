@@ -4,6 +4,7 @@
 
 mod bounded;
 pub(in crate::server::core::account_store) mod codearts_result;
+pub(in crate::server::core::account_store) mod codearts_reclaim;
 pub(in crate::server::core::account_store) mod codearts_slot;
 pub(in crate::server::core::account_store) mod codearts_enrollment;
 pub(in crate::server::core::account_store) mod doubao_state;

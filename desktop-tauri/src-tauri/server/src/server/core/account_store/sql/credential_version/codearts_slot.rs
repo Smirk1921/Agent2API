@@ -271,6 +271,8 @@ pub(in crate::server::core::account_store) fn complete(
         settled_operation: Some(pending.operation.clone()),
     };
     record::update(conn, key, &slot)?;
+    // 本轮已真正换票成功：清掉自动 reclaim 冷却，下一次新的封锁可以立即恢复。
+    let _ = super::codearts_reclaim::delete(conn, &stamp.id);
     Ok(Settlement::Rotated(CommitReceipt {
         revision_advanced: true,
     }))
@@ -312,6 +314,47 @@ pub(in crate::server::core::account_store) fn cancel_pending(
         settled_operation: Some(pending.operation.clone()),
     };
     record::update(conn, key, &slot)
+}
+
+/// 自动 reclaim 一个 Blocked 槽：改回 Ready（同 revision、新 generation）。
+///
+/// 只允许在账号版本与槽绑定完全一致时执行；版本不一致说明账号在封锁后被
+/// 重新导入/改过，回退 Ready 也过不了读校验，交给登记流程处理，返回 false。
+/// Blocked 的操作语义是「可能已发出但结果未确认」，重试不会造成二次消费：
+/// 令牌若已被消费，上游只会再拒绝一次；若没有，则正好恢复。
+pub(in crate::server::core::account_store) fn reclaim_blocked(
+    conn: &Connection,
+    key: &[u8; 32],
+    id: &str,
+) -> Result<bool, SlotFailure> {
+    if conn.is_autocommit() {
+        return Err(Error::Storage(StorageFailure::Begin).into());
+    }
+    let mut slot = record::load(conn, key, id)?;
+    let State::Blocked { operation } = &slot.state else {
+        return Ok(false);
+    };
+    let operation = operation.clone();
+    let account = storage::load(conn, key, id)?;
+    let Some(version) = storage::version(&account)? else {
+        return Ok(false);
+    };
+    if slot.db_epoch != version.epoch
+        || slot.born != version.born
+        || slot.revision != version.revision
+    {
+        return Ok(false);
+    }
+    let next = storage::random_id()?;
+    if next == slot.generation || next == operation {
+        return Err(Error::Storage(StorageFailure::RandomUnavailable).into());
+    }
+    slot.generation = next;
+    slot.state = State::Ready {
+        settled_operation: Some(operation),
+    };
+    record::update(conn, key, &slot)?;
+    Ok(true)
 }
 
 fn current(

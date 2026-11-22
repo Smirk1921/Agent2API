@@ -414,6 +414,19 @@ pub(in crate::server::core::account_store::sql) fn delete(
                     [id],
                 )?;
             }
+            // 自动 reclaim 的冷却记录同样是附属行；不清理会让同 id 重导入继承旧时间。
+            let has_reclaims: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema
+                    WHERE type = 'table' AND name = 'codearts_refresh_reclaims')",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_reclaims {
+                conn.execute(
+                    "DELETE FROM main.codearts_refresh_reclaims WHERE account_id = ?1",
+                    [id],
+                )?;
+            }
         }
         Ok(removed)
     })

@@ -20,6 +20,7 @@ use serde_json::Value;
 
 use super::{cached_key, source_error, sql, AccountStore, Error, ReadStamp, StorageFailure};
 use crate::server::db::{CodeArtsStorageError, CodeArtsTransaction, CredentialSource};
+use sql::credential_version::codearts_reclaim;
 use sql::credential_version::codearts_slot::{self as slots, PendingWrite, ReadyGeneration};
 
 pub(crate) use slots::{Settlement as SlotSettlement, SlotFailure};
@@ -500,5 +501,76 @@ impl AccountStore {
             }
         }
         completed
+    }
+
+    /// 维护周期入口：把封锁超过 `cooldown_ms` 的 CodeArts 槽自动回退为 Ready。
+    ///
+    /// Blocked 的语义是「上一次操作可能已发出、结果未确认」，重试不会造成二次
+    /// 消费：令牌若已被上游消费，只会再得到一次拒绝；若没有，正好恢复。冷却时间
+    /// 避免对真正失效的账号每个维护周期都打一次上游；换票成功会在结算事务里
+    /// 清掉冷却记录。
+    ///
+    /// 返回本轮回退的账号数。日志一律在事务外写（事务内写日志会自锁）。
+    pub(crate) fn reclaim_codearts_blocked(&self, cooldown_ms: i64) -> usize {
+        let Ok(key) = cached_key() else { return 0 };
+        let now = crate::server::logging::now_ms();
+        if now <= 0 || cooldown_ms < 0 {
+            return 0;
+        }
+        let mut reclaimed: Vec<String> = Vec::new();
+        let outcome = self.with_lock(|guard| {
+            self.with_conn_mut(guard, |conn| {
+                let has_slots: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema
+                        WHERE type = 'table' AND name = 'codearts_refresh_slots')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if !has_slots {
+                    return Ok(());
+                }
+                let ids: Vec<String> = {
+                    let mut statement =
+                        conn.prepare("SELECT account_id FROM main.codearts_refresh_slots")?;
+                    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                for id in ids {
+                    let last = codearts_reclaim::last(&tx, &id).map_err(journal_error)?;
+                    if now.saturating_sub(last) < cooldown_ms {
+                        continue;
+                    }
+                    match slots::reclaim_blocked(&tx, &key, &id) {
+                        Ok(true) => {
+                            codearts_reclaim::mark(&tx, &id, now).map_err(journal_error)?;
+                            reclaimed.push(id);
+                        }
+                        // 非 Blocked、版本不一致、坏行：跳过，不影响其它账号。
+                        Ok(false) => {}
+                        Err(_) => {}
+                    }
+                }
+                tx.commit()
+            })
+        });
+        if let Err(error) = &outcome {
+            crate::server::logging::log(
+                "[Accounts]",
+                &format!("CodeArts 封锁槽自动恢复：本轮事务失败（{}）", error.message),
+            );
+        }
+        if !reclaimed.is_empty() {
+            if let Some(db) = self.database() {
+                db.invalidate_accounts();
+            }
+            for id in &reclaimed {
+                crate::server::logging::log(
+                    "[Accounts]",
+                    &format!("CodeArts 封锁槽自动恢复：账号 {id} 已回退为 Ready，本轮重试"),
+                );
+            }
+        }
+        reclaimed.len()
     }
 }

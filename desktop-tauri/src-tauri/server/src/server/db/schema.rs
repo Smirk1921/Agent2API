@@ -390,6 +390,19 @@ CREATE TABLE IF NOT EXISTS main.codearts_refresh_results (
 ) WITHOUT ROWID;
 ";
 
+/// CodeArts 封锁槽的自动 reclaim 冷却记录（每账号一行）。
+///
+/// Blocked 只表示「上一次操作可能已发出、结果未确认」，重试是安全的：
+/// 令牌未被消费就会成功，已消费只会再得到一次 `used`。这里记录最近一次
+/// 自动 reclaim 的时间，避免维护周期对同一个真正失效的账号反复打上游。
+pub(crate) const CODEARTS_RECLAIM_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS main.codearts_refresh_reclaims (
+  account_id TEXT NOT NULL PRIMARY KEY
+    CHECK (typeof(account_id) = 'text' AND octet_length(account_id) BETWEEN 1 AND 512),
+  attempted_at INTEGER NOT NULL CHECK (typeof(attempted_at) = 'integer')
+) WITHOUT ROWID;
+";
+
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
 /// 为什么把六张表写成一个 batch 而不是每张一个常量再拼：它们共同构成「版本 1
