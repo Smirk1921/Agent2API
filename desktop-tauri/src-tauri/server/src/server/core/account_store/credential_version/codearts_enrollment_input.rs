@@ -210,6 +210,36 @@ impl EnrollmentInput {
     }
 }
 
+/// 校验“从已存账号里取出的材料”能否用于登记续期槽。
+///
+/// 与 [`EnrollmentInput::parse`] 的区别只有一处：**允许 access token 已过期**。
+/// 导入的是历史导出文件，宿主换票只要求槽与可用的 refresh token + 原 OAuth 材料；
+/// 拒绝过期材料会让最需要恢复的账号反而登记不了。
+pub(crate) fn validate_imported(fields: &Map<String, Value>) -> Result<(), EnrollmentInputError> {
+    allowed(fields, MATERIAL_FIELDS)?;
+    if let Some(provider) = fields.get("provider") {
+        if provider.as_str() != Some("codearts") {
+            return Err(EnrollmentInputError::WrongProvider);
+        }
+    }
+    let material = Material::read(fields)?;
+    let context = oauth::validate(
+        fields
+            .get("oauth_context")
+            .ok_or(EnrollmentInputError::MissingMaterial)?,
+    )?;
+    let _ = expiration(fields, material.expiration)?;
+    let identity = format!("codearts-{}-{}", material.domain, material.user);
+    if protected(material.domain, fields)
+        || protected(material.user, fields)
+        || protected(&identity, fields)
+    {
+        return Err(EnrollmentInputError::InvalidIdentity);
+    }
+    drop(context);
+    Ok(())
+}
+
 // 同次原生材料及仓内已使用镜像。未知字段拒绝；不接受UID猜测、JWT身份或任意包装。
 const MATERIAL_FIELDS: &[&str] = &[
     "provider",

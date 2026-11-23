@@ -125,6 +125,40 @@ pub(in crate::server::core::account_store::sql::credential_version) fn establish
     )
 }
 
+/// 导入完成后的自动登记：按账号当前版本建立 Ready 槽。
+///
+/// - 已有同版本的 Ready 槽：什么都不做，返回 false（不覆盖正常槽）；
+/// - 缺槽、槽版本不符或槽停在 Pending/Blocked：删掉旧行后按当前版本重建。
+///
+/// 材料合法性由调用方先校验；这里只处理槽的存储状态。整段必须在事务内。
+pub(in crate::server::core::account_store) fn establish_imported(
+    conn: &Connection,
+    key: &[u8; 32],
+    id: &str,
+    version: &Version,
+) -> Result<bool, SlotFailure> {
+    if conn.is_autocommit() {
+        return Err(Error::Storage(StorageFailure::Begin).into());
+    }
+    record::initialize_empty(conn)?;
+    if let Ok(slot) = record::load(conn, key, id) {
+        if slot.db_epoch == version.epoch
+            && slot.born == version.born
+            && slot.revision == version.revision
+            && matches!(slot.state, State::Ready { .. })
+        {
+            return Ok(false);
+        }
+    }
+    conn.execute(
+        "DELETE FROM main.codearts_refresh_slots WHERE account_id = ?1",
+        [id],
+    )
+    .map_err(|error| storage::sql_error(error, StorageFailure::Write))?;
+    establish_initial(conn, key, id, version)?;
+    Ok(true)
+}
+
 /// 只读同原FULL/IMMEDIATE事务：读取真实加密行、已有版本/epoch、完整投影与同代Ready。
 /// 不调用prepare/establish_epoch/initialize_empty；缺任何前置都拒绝，无写入动作。
 pub(in crate::server::core::account_store) fn read_ready(
@@ -833,6 +867,140 @@ pub(in crate::server::core::account_store) fn recover_one(
         Err(error) => {
             let _ = block(conn, key, &stamp, &pending);
             Ok(Recovery::Failed(error))
+        }
+    }
+}
+
+/// 导入后自动登记的结果；`Skipped` 只携带固定原因码，不回显凭据。
+pub(in crate::server::core::account_store) enum ImportedEnrollmentResult {
+    Established,
+    Already,
+    Skipped(&'static str),
+}
+
+fn pick_material(
+    secret: &Map<String, Value>,
+    fields: &Map<String, Value>,
+    aliases: &[&str],
+) -> Result<Option<String>, &'static str> {
+    for source in [secret, fields] {
+        let mut found: Option<String> = None;
+        for alias in aliases {
+            let Some(Value::String(text)) = source.get(*alias) else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            match &found {
+                None => found = Some(text.clone()),
+                Some(previous) if previous == text => {}
+                Some(_) => return Err("alias-conflict"),
+            }
+        }
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    Ok(None)
+}
+
+/// 只从已存账号里取登记白名单字段；未知字段与嵌套结构不进入校验。
+fn imported_material(account: &StoredAccount) -> Result<Value, &'static str> {
+    let empty = Map::new();
+    let (secret, fields) = match account.get("pluginSecret") {
+        Some(Value::Object(secret)) if !secret.is_empty() => (secret, account.fields()),
+        _ => (&empty, account.fields()),
+    };
+    let access = pick_material(secret, fields, &["access_key_id", "accessKeyId", "accessToken"])?
+        .ok_or("missing-access")?;
+    let secret_key = pick_material(secret, fields, &["secret_access_key", "secretAccessKey"])?
+        .ok_or("missing-secret")?;
+    let security = pick_material(secret, fields, &["security_token", "securityToken"])?
+        .ok_or("missing-security")?;
+    let refresh = pick_material(secret, fields, &["refresh_token", "refreshToken"])?
+        .ok_or("missing-refresh")?;
+    let expiration = pick_material(secret, fields, &["expiration", "expires_at"])?
+        .ok_or("missing-expiration")?;
+    let domain = pick_material(secret, fields, &["domain_id", "account_id", "domainId"])?
+        .ok_or("missing-domain")?;
+    let user = pick_material(secret, fields, &["user_id", "principal_id", "userId"])?
+        .ok_or("missing-user")?;
+    let context = secret
+        .get("oauth_context")
+        .or_else(|| fields.get("oauth_context"))
+        .cloned()
+        .ok_or("missing-oauth")?;
+    let mut out = Map::new();
+    out.insert("provider".into(), Value::String("codearts".into()));
+    out.insert("access_key_id".into(), Value::String(access));
+    out.insert("secret_access_key".into(), Value::String(secret_key));
+    out.insert("security_token".into(), Value::String(security));
+    out.insert("refresh_token".into(), Value::String(refresh));
+    out.insert("expiration".into(), Value::String(expiration));
+    out.insert("domain_id".into(), Value::String(domain));
+    out.insert("user_id".into(), Value::String(user));
+    out.insert("oauth_context".into(), context);
+    let expires_at = secret
+        .get("expiresAt")
+        .and_then(Value::as_i64)
+        .or_else(|| fields.get("expiresAt").and_then(Value::as_i64));
+    if let Some(ms) = expires_at {
+        out.insert("expiresAt".into(), Value::from(ms));
+    }
+    let name = account
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .or_else(|| secret.get("user_name").and_then(Value::as_str))
+        .or_else(|| fields.get("user_name").and_then(Value::as_str));
+    if let Some(name) = name {
+        out.insert("name".into(), Value::String(name.to_string()));
+    }
+    Ok(Value::Object(out))
+}
+
+/// 同一条事务内完成“读账号 → 校验材料 → 建立 Ready 槽”，避免校验与登记之间
+/// 账号被改动。材料不合法时返回固定原因码，不抛错。
+pub(in crate::server::core::account_store) fn enroll_imported(
+    conn: &Connection,
+    key: &[u8; 32],
+    id: &str,
+) -> Result<ImportedEnrollmentResult, SlotFailure> {
+    if conn.is_autocommit() {
+        return Err(Error::Storage(StorageFailure::Begin).into());
+    }
+    let account = match storage::load(conn, key, id) {
+        Ok(account) => account,
+        Err(Error::Conflict(Conflict::MissingAccount)) => {
+            return Ok(ImportedEnrollmentResult::Skipped("account-unavailable"))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if account.provider() != "codearts" {
+        return Ok(ImportedEnrollmentResult::Skipped("not-codearts"));
+    }
+    let Some(version) = storage::version(&account)? else {
+        return Ok(ImportedEnrollmentResult::Skipped("no-version"));
+    };
+    let candidate = match imported_material(&account) {
+        Ok(candidate) => candidate,
+        Err(reason) => return Ok(ImportedEnrollmentResult::Skipped(reason)),
+    };
+    let Some(fields) = candidate.as_object() else {
+        return Ok(ImportedEnrollmentResult::Skipped("material-invalid"));
+    };
+    if let Err(error) =
+        crate::server::core::account_store::credential_version::validate_imported(fields)
+    {
+        return Ok(ImportedEnrollmentResult::Skipped(error.code()));
+    }
+    match establish_imported(conn, key, id, &version) {
+        Ok(true) => Ok(ImportedEnrollmentResult::Established),
+        Ok(false) => Ok(ImportedEnrollmentResult::Already),
+        Err(error) => {
+            let _ = error;
+            Ok(ImportedEnrollmentResult::Skipped("slot-state"))
         }
     }
 }

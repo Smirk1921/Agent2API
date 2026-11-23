@@ -983,6 +983,9 @@ pub async fn import_accounts(state: &ServerState, body: &Bytes) -> Response {
         Ok(mut result) => {
             let ids = super::account_import_setup::imported_ids(&result);
             super::account_import_setup::complete(state, &ids, &mut result).await;
+            // CodeArts 导出的账号记录不含宿主续期槽；导入后自动用已存材料登记，
+            // 否则刷新会停在「没有可用的受控续期登记」。
+            super::account_import_setup::enroll_codearts(state, &ids, &mut result).await;
             ok_json(result)
         }
         Err(error) => store_error(error),

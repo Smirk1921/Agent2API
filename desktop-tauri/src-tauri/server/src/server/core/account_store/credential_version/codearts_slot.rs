@@ -25,6 +25,13 @@ use sql::credential_version::codearts_slot::{self as slots, PendingWrite, ReadyG
 
 pub(crate) use slots::{Settlement as SlotSettlement, SlotFailure};
 
+/// 导入完成后的自动登记结论（只用于导入报告，不携带凭据）。
+pub(crate) enum ImportedEnrollment {
+    Established,
+    Already,
+    Skipped(&'static str),
+}
+
 /// 只有Committed(T)交付后续材料；已提交但收尾失败和未知提交不允许发送或补回Ready。
 #[must_use]
 pub(crate) enum SlotOutcome<T> {
@@ -572,5 +579,45 @@ impl AccountStore {
             }
         }
         reclaimed.len()
+    }
+}
+
+impl AccountStore {
+    /// 导入完成后的自动登记：校验已存材料并建立 Ready 槽。
+    ///
+    /// 只对 CodeArts 账号生效；材料不完整/自相矛盾/缺少 OAuth 材料时返回 `Skipped`
+    /// 并在导入报告里回显原因，不会让整批导入失败。
+    pub(crate) fn enroll_imported_codearts(
+        &self,
+        id: &str,
+    ) -> Result<ImportedEnrollment, String> {
+        let key = cached_key().map_err(|_| "账号密钥不可用".to_string())?;
+        let mut verdict = ImportedEnrollment::Skipped("unknown");
+        let outcome = self.with_lock(|guard| {
+            self.with_conn_mut(guard, |conn| {
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                match slots::enroll_imported(&tx, &key, id) {
+                    Ok(slots::ImportedEnrollmentResult::Established) => {
+                        verdict = ImportedEnrollment::Established;
+                    }
+                    Ok(slots::ImportedEnrollmentResult::Already) => {
+                        verdict = ImportedEnrollment::Already;
+                    }
+                    Ok(slots::ImportedEnrollmentResult::Skipped(reason)) => {
+                        verdict = ImportedEnrollment::Skipped(reason);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        verdict = ImportedEnrollment::Skipped(error.reason());
+                        return Ok(());
+                    }
+                }
+                tx.commit()
+            })
+        });
+        match outcome {
+            Ok(()) => Ok(verdict),
+            Err(error) => Err(error.message),
+        }
     }
 }

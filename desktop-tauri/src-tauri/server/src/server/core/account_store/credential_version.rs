@@ -3,13 +3,13 @@
 
 // 封闭开发基础：不导出发送许可或首次纳管入口，也不改变现有 RowSource 接口。
 mod codearts_slot;
-pub(crate) use codearts_slot::{ReadyRead, PendingSlot, PendingBinding, SlotOutcome, SlotFailure, SlotSettlement};
+pub(crate) use codearts_slot::{ReadyRead, PendingSlot, PendingBinding, SlotOutcome, SlotFailure, SlotSettlement, ImportedEnrollment};
 pub(crate) use codearts_slot::{PendingFinalCheck, PendingFinalState, PendingFinalCallback, PendingCommitFact, PendingFinalError};
 pub(crate) use codearts_slot::{PendingCompletion, PendingCompletionCheck, PendingCompletionState, PendingCompletionCallback};
 pub(in crate::server::core::account_store) use codearts_slot::{PendingFinalRead, PendingCompletionRead};
 mod codearts_enrollment_input;
 mod codearts_enrollment;
-pub(crate) use codearts_enrollment_input::EnrollmentInput;
+pub(crate) use codearts_enrollment_input::{validate_imported, EnrollmentInput};
 pub(crate) use codearts_enrollment::{EnrollmentOrigin, EnrollmentCommitOutcome, EnrollmentError as EnrollmentStorageError};
 pub(crate) mod doubao_state;
 

@@ -33,6 +33,53 @@ import { activeGroupSortRules, manualOrderBlockedMessage } from './accounts-grou
 import { Badge, Spinner } from '@ui'
 import { Alert } from '@ui'
 
+type AccountImportOutcome = {
+  canceled?: boolean
+  added?: number
+  updated?: number
+  skipped?: number
+  failed?: number
+  errors?: Array<{ id?: string; message?: string; customProvider?: boolean }>
+  codeartsEnrollment?: { established?: number; already?: number; skipped?: number; failed?: number }
+}
+
+/**
+ * 从导出的账号 JSON 导入（文件解析与信封/单账号兼容由壳/网页桥统一处理）。
+ * 导入完成后端会为 CodeArts 自动登记续期槽，这里只负责汇总与刷新列表。
+ */
+async function importAccountFile(): Promise<void> {
+  const bridge = shared().workbuddyDesktop as unknown as
+    { importAccounts?: () => Promise<AccountImportOutcome | null | undefined> } | undefined
+  if (!bridge?.importAccounts) {
+    toast(t('当前环境不支持文件导入'), 'err')
+    return
+  }
+  try {
+    const result = await bridge.importAccounts()
+    if (!result) return
+    if (result.canceled) { toast(t('已取消导入')); return }
+    const added = Number(result.added) || 0
+    const updated = Number(result.updated) || 0
+    const failed = Number(result.failed) || 0
+    const enrolled = Number(result.codeartsEnrollment?.established) || 0
+    const already = Number(result.codeartsEnrollment?.already) || 0
+    const enrollment = enrolled || already
+      ? t('，CodeArts 续期登记 新建 {established} 个、已有 {already} 个', {
+        established: String(enrolled), already: String(already),
+      })
+      : ''
+    const summary = t('新增 {added} 个、更新 {updated} 个{enrollment}', {
+      added: String(added), updated: String(updated), enrollment,
+    })
+    toast(failed
+      ? t('导入完成：{summary}，失败 {failed} 个', { summary, failed: String(failed) })
+      : t('✅ 导入完成：{summary}', { summary }), failed ? 'err' : 'ok')
+    await refreshList({ feedback: true })
+  } catch (error) {
+    toast(t('导入失败：{message}', { message: error instanceof Error ? error.message : String(error) }), 'err')
+  }
+}
+
 /** 列设置的句柄（注册在挂载后的布局 effect 里，见下方说明） */
 let colHandle: ColSettingsHandle | null = null
 /** 列设置是否已经登记过（登记只做一次：它是全局注册表，重复登记会插出第二颗齿轮） */
@@ -478,6 +525,8 @@ function AccountsPage() {
               onClick={() => void refreshList({ feedback: true })}>
               {store.listBusy ? t('刷新中…') : t('刷新')}
             </Button>
+            <Button id='btn-import-accounts' variant='outline' title={t('从导出的 JSON 文件导入账号，CodeArts 会自动登记续期')}
+              onClick={() => void importAccountFile()}>{t('导入账号')}</Button>
             {/* 「添加账号」的打开逻辑归 add-account.js（它按同一个 id 绑了监听），这里再挂
                 一次 onClick 是**冗余保险**：万一那个脚本的绑定因加载顺序没接上，按钮仍可用
                 （openModal / resetAddStep 都是幂等的，重复调用无副作用） */}

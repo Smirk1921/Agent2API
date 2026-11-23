@@ -95,3 +95,69 @@ fn public_report(value: &Value) -> Value {
         _ => json!({ "status": "failed", "message": "提供商插件未返回有效的套餐检查结果，暂不能确认开通状态" }),
     }
 }
+
+/// 导入完成后自动为 CodeArts 账号建立续期槽。
+///
+/// 导出的账号记录不含宿主私有的续期槽；只导入账号行时，刷新会停在
+/// 「没有可用的受控续期登记」。这里用已存材料做一次受控登记：材料合法就建
+/// Ready 槽，不合法则逐条回显原因，不影响整批导入结果。
+pub(super) async fn enroll_codearts(state: &ServerState, ids: &[String], result: &mut Value) {
+    use crate::server::core::account_store::credential_version::ImportedEnrollment;
+
+    let store = state.store().clone();
+    let ids = ids.to_vec();
+    let reports = crate::server::core::blocking::run(move || {
+        let mut reports: Vec<Value> = Vec::new();
+        for id in ids {
+            if store.account_provider_of(&id).as_deref() != Some("codearts") {
+                continue;
+            }
+            let name = store
+                .route_account(&id)
+                .and_then(|account| account.get("name").and_then(Value::as_str).map(str::to_string))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| id.clone());
+            let (status, reason): (&str, Option<String>) = match store.enroll_imported_codearts(&id) {
+                Ok(ImportedEnrollment::Established) => ("enrolled", None),
+                Ok(ImportedEnrollment::Already) => ("already", None),
+                Ok(ImportedEnrollment::Skipped(reason)) => ("skipped", Some(reason.to_string())),
+                Err(error) => ("failed", Some(error)),
+            };
+            reports.push(json!({
+                "id": id,
+                "name": name,
+                "status": status,
+                "reason": reason,
+            }));
+        }
+        reports
+    })
+    .await
+    .unwrap_or_default();
+    if reports.is_empty() {
+        return;
+    }
+    let count = |status: &str| {
+        reports
+            .iter()
+            .filter(|report| report.get("status").and_then(Value::as_str) == Some(status))
+            .count()
+    };
+    let established = count("enrolled");
+    let already = count("already");
+    let skipped = count("skipped");
+    let failed = count("failed");
+    logging::log(
+        "[Accounts]",
+        &format!(
+            "CodeArts 导入后自动登记：新建续期槽 {established} 个，已登记 {already} 个，跳过 {skipped} 个，失败 {failed} 个"
+        ),
+    );
+    result["codeartsEnrollment"] = json!({
+        "established": established,
+        "already": already,
+        "skipped": skipped,
+        "failed": failed,
+        "reports": reports,
+    });
+}
