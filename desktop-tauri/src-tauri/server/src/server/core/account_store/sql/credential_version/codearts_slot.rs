@@ -970,7 +970,7 @@ pub(in crate::server::core::account_store) fn enroll_imported(
     if conn.is_autocommit() {
         return Err(Error::Storage(StorageFailure::Begin).into());
     }
-    let account = match storage::load(conn, key, id) {
+    let mut account = match storage::load(conn, key, id) {
         Ok(account) => account,
         Err(Error::Conflict(Conflict::MissingAccount)) => {
             return Ok(ImportedEnrollmentResult::Skipped("account-unavailable"))
@@ -980,9 +980,6 @@ pub(in crate::server::core::account_store) fn enroll_imported(
     if account.provider() != "codearts" {
         return Ok(ImportedEnrollmentResult::Skipped("not-codearts"));
     }
-    let Some(version) = storage::version(&account)? else {
-        return Ok(ImportedEnrollmentResult::Skipped("no-version"));
-    };
     let candidate = match imported_material(&account) {
         Ok(candidate) => candidate,
         Err(reason) => return Ok(ImportedEnrollmentResult::Skipped(reason)),
@@ -995,6 +992,22 @@ pub(in crate::server::core::account_store) fn enroll_imported(
     {
         return Ok(ImportedEnrollmentResult::Skipped(error.code()));
     }
+    // 导出的账号文件不含宿主私有的 `_hostCredentialVersion`；材料校验通过后
+    // 在同一事务里补建版本，否则自动登记只能返回 no-version。
+    let version = match storage::version(&account)? {
+        Some(version) => version,
+        None => {
+            let epoch = match storage::epoch(conn)? {
+                Some(epoch) => epoch,
+                None => storage::establish_epoch(conn)?,
+            };
+            let born = storage::random_id()?;
+            let version = Version { epoch, born, revision: 1 };
+            storage::set_version(&mut account, &version);
+            storage::update_existing(conn, key, &account)?;
+            version
+        }
+    };
     match establish_imported(conn, key, id, &version) {
         Ok(true) => Ok(ImportedEnrollmentResult::Established),
         Ok(false) => Ok(ImportedEnrollmentResult::Already),

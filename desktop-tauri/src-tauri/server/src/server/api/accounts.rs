@@ -252,6 +252,12 @@ async fn add_plugin_account(
                 if let Some(account) = state.store().plugin_account(&imported_id) {
                     result["account"] = account.get("public").cloned().unwrap_or(Value::Null);
                 }
+            } else if !imported_id.is_empty() && provider == "codearts" {
+                // 面板「添加账号」粘贴的 CodeArts 记录与导出文件一样不含宿主续期槽：
+                // 只写账号行的话，下次到期刷新会停在「没有可用的受控续期登记」。
+                // 与文件导入共用同一条受控登记 —— 材料不合规只回显原因，不影响添加结果。
+                super::account_import_setup::enroll_codearts(state, &[imported_id.clone()], &mut result)
+                    .await;
             }
             crate::server::core::providers::subscriptions::refresh_after_account_saved(
                 state.store().clone(), provider, &imported_id,

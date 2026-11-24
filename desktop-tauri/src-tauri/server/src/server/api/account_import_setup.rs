@@ -150,7 +150,7 @@ pub(super) async fn enroll_codearts(state: &ServerState, ids: &[String], result:
     logging::log(
         "[Accounts]",
         &format!(
-            "CodeArts 导入后自动登记：新建续期槽 {established} 个，已登记 {already} 个，跳过 {skipped} 个，失败 {failed} 个"
+            "CodeArts 自动登记：新建续期槽 {established} 个，已登记 {already} 个，跳过 {skipped} 个，失败 {failed} 个"
         ),
     );
     result["codeartsEnrollment"] = json!({
